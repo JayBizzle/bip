@@ -1,0 +1,968 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bip</title>
+<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+<style>
+  body {
+    margin: 0;
+    padding: 16px;
+    background: #111;
+    color: #ccc;
+    font-family: 'Press Start 2P', monospace;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 16px;
+  }
+  canvas {
+    /* Fill as much of the window as the 16:10 aspect ratio allows, leaving room for the key legend. */
+    width: min(calc(100vw - 40px), calc((100vh - 170px) * 1.6));
+    aspect-ratio: 320 / 200;
+    image-rendering: pixelated;
+    border: 4px solid #444;
+  }
+  .keys { display: flex; gap: 48px; font-size: 10px; line-height: 2; }
+  .p1 { color: #f55; }
+  .p2 { color: #6af; }
+</style>
+</head>
+<body>
+<canvas id="screen" width="1920" height="1200"></canvas>
+<div class="keys">
+  <div class="p1">PLAYER 1<br>W throttle on/off<br>A loop back<br>D loop forward<br>S fire</div>
+  <div class="p2">PLAYER 2<br>&uarr; throttle on/off<br>&rarr; loop back<br>&larr; loop forward<br>M fire</div>
+</div>
+<script>
+// Game runs in a 320x200 buffer (Amiga lowres) and is scaled up 6x.
+const W = 320, H = 200, GROUND = 182, WIN_SCORE = 10;
+// Gravity outweighs the engine, so any sustained climb bleeds speed even at full throttle.
+// Take-off speed is well above the stall so a plane leaves the runway with room to climb.
+const MAX_SPEED = 95, ACCEL = 30, GROUND_ACCEL = 45, DRAG = 14, GROUND_FRICTION = 30;
+const TAKEOFF = 60, STALL = 28, GRAVITY = 70, TURN = 4.2;
+const BULLET_SPEED = 170, BULLET_LIFE = 1.1, FIRE_DELAY = 0.18, RESPAWN = 2.5;
+// Gun overheating: each shot adds heat, which cools over time. Hit the max and the gun jams until fully cool.
+const HEAT_PER_SHOT = 0.15, COOL_RATE = 0.3, JAMMED_COOL_RATE = 0.5;
+// Popping the balloon grants rapid fire: faster shots and no overheating for a few seconds.
+const RAPID_TIME = 3, RAPID_FIRE_DELAY = 0.08;
+// After popping, the balloon returns at a random time and place.
+const BALLOON_MIN_DELAY = 5, BALLOON_MAX_DELAY = 15, BALLOON_HITS = 5;
+// Seagull: shoot it to launch a homing missile at the opponent. The missile turns slower
+// than a plane, so a tight loop can shake it, and it can be shot down.
+const GULL_MIN_DELAY = 8, GULL_MAX_DELAY = 20, GULL_SPEED = 35;
+const MISSILE_SPEED = 110, MISSILE_TURN = 2.2, MISSILE_FUEL = 10;
+// Bail-out: pilot freefalls briefly, then the chute opens. Landing too fast without one is fatal.
+const CHUTE_DELAY = 0.5, CHUTE_SPEED = 14, SAFE_LANDING_SPEED = 40, LANDED_TIME = 1.5;
+// Planes collide when their sprites visibly overlap, not just their centres.
+const PLANE_COLLIDE = 12;
+
+const screen = document.getElementById('screen');
+const sctx = screen.getContext('2d');
+const buf = document.createElement('canvas');
+buf.width = W; buf.height = H;
+const ctx = buf.getContext('2d');
+ctx.imageSmoothingEnabled = false;
+sctx.imageSmoothingEnabled = false;
+// Backing store is 2x so the HUD text stays sharp at large sizes; draw in 960x600 units.
+sctx.setTransform(2, 0, 0, 2, 0, 0);
+
+// ---------- Sprites ----------
+const PLANE_ART = [
+  '................',
+  '....WWWWWWWW....',
+  '.....k.w..k.....',
+  'T....k....k...p.',
+  'TT.BBBBBBBBBBBp.',
+  'TBBBBBBBBBBBBNp.',
+  '....WWWWWWWW.p..',
+  '.......k..k.....',
+  '......o....o....',
+];
+
+function makeSprite(body, wing) {
+  const c = document.createElement('canvas');
+  c.width = 16; c.height = 9;
+  const g = c.getContext('2d');
+  const pal = { B: body, T: body, W: wing, k: '#222', p: '#ccc', o: '#111', N: '#999', w: '#fc9' };
+  PLANE_ART.forEach((row, y) => [...row].forEach((ch, x) => {
+    if (pal[ch]) { g.fillStyle = pal[ch]; g.fillRect(x, y, 1, 1); }
+  }));
+  return c;
+}
+
+// ---------- Input ----------
+const keys = new Set();
+addEventListener('keydown', e => {
+  if (e.code.startsWith('Arrow') || e.code === 'Space') e.preventDefault();
+  keys.add(e.code);
+  initAudio();
+  if (!e.repeat && game.state === 'play') {
+    for (const p of players) {
+      if (e.code === p.keys.throttle && p.state === 'alive') p.throttleOn = !p.throttleOn;
+    }
+  }
+  if (e.code === 'Space' && game.state !== 'play') startGame();
+});
+addEventListener('keyup', e => keys.delete(e.code));
+addEventListener('blur', () => keys.clear());
+
+// ---------- Audio ----------
+let ac = null;
+const engines = [];
+
+function initAudio() {
+  if (ac) return;
+  ac = new AudioContext();
+  players.forEach((p, i) => {
+    const o = ac.createOscillator();
+    o.type = 'sawtooth';
+    const f = ac.createBiquadFilter();
+    f.type = 'lowpass';
+    f.frequency.value = 400;
+    const g = ac.createGain();
+    g.gain.value = 0;
+    o.connect(f).connect(g).connect(ac.destination);
+    o.start();
+    engines[i] = { o, g };
+  });
+}
+
+function updateEngines() {
+  if (!ac) return;
+  players.forEach((p, i) => {
+    const on = game.state === 'play' && p.state !== 'dead';
+    let gain = on ? (p.throttleOn ? 0.03 : 0.012) : 0;
+    let freq = 45 + p.speed * 1.2 + i * 7;
+    // Near the stall the engine coughs: random dropouts and pitch dips.
+    const coughing = on && p.state === 'alive' && Math.random() < p.stallWarn * 0.5;
+    if (coughing) { gain *= 0.1; freq *= 0.7; }
+    engines[i].g.gain.setTargetAtTime(gain, ac.currentTime, coughing ? 0.01 : 0.05);
+    engines[i].o.frequency.setTargetAtTime(freq, ac.currentTime, 0.05);
+  });
+}
+
+function sfxShot() {
+  if (!ac) return;
+  const t = ac.currentTime;
+  const o = ac.createOscillator();
+  const g = ac.createGain();
+  o.type = 'square';
+  o.frequency.setValueAtTime(900, t);
+  o.frequency.exponentialRampToValueAtTime(150, t + 0.06);
+  g.gain.setValueAtTime(0.05, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + 0.07);
+  o.connect(g).connect(ac.destination);
+  o.start(t);
+  o.stop(t + 0.08);
+}
+
+function sfxBoom(dur = 0.8, vol = 0.3) {
+  if (!ac) return;
+  const t = ac.currentTime;
+  const b = ac.createBuffer(1, ac.sampleRate * dur, ac.sampleRate);
+  const d = b.getChannelData(0);
+  for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  const s = ac.createBufferSource();
+  s.buffer = b;
+  const f = ac.createBiquadFilter();
+  f.type = 'lowpass';
+  f.frequency.setValueAtTime(900, t);
+  f.frequency.exponentialRampToValueAtTime(80, t + dur);
+  const g = ac.createGain();
+  g.gain.setValueAtTime(vol, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  s.connect(f).connect(g).connect(ac.destination);
+  s.start(t);
+}
+
+function sfxHit() {
+  if (!ac) return;
+  const t = ac.currentTime;
+  const o = ac.createOscillator();
+  const g = ac.createGain();
+  o.type = 'triangle';
+  o.frequency.setValueAtTime(600, t);
+  o.frequency.exponentialRampToValueAtTime(300, t + 0.05);
+  g.gain.setValueAtTime(0.08, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + 0.06);
+  o.connect(g).connect(ac.destination);
+  o.start(t);
+  o.stop(t + 0.07);
+}
+
+function sfxSquawk() {
+  if (!ac) return;
+  const t0 = ac.currentTime;
+  // Two harsh, warbling squawks.
+  [0, 0.2].forEach(delay => {
+    const t = t0 + delay;
+    const o = ac.createOscillator();
+    o.type = 'sawtooth';
+    o.frequency.setValueAtTime(1300, t);
+    o.frequency.linearRampToValueAtTime(800, t + 0.08);
+    o.frequency.linearRampToValueAtTime(1000, t + 0.16);
+    const lfo = ac.createOscillator();
+    lfo.frequency.value = 35;
+    const lg = ac.createGain();
+    lg.gain.value = 120;
+    lfo.connect(lg).connect(o.frequency);
+    const f = ac.createBiquadFilter();
+    f.type = 'bandpass';
+    f.frequency.value = 1400;
+    f.Q.value = 1.5;
+    const g = ac.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.15, t + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.17);
+    o.connect(f).connect(g).connect(ac.destination);
+    o.start(t);
+    lfo.start(t);
+    o.stop(t + 0.18);
+    lfo.stop(t + 0.18);
+  });
+}
+
+function sfxLaunch() {
+  if (!ac) return;
+  const t = ac.currentTime, len = 0.5;
+  const b = ac.createBuffer(1, ac.sampleRate * len, ac.sampleRate);
+  const d = b.getChannelData(0);
+  for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  const s = ac.createBufferSource();
+  s.buffer = b;
+  const f = ac.createBiquadFilter();
+  f.type = 'bandpass';
+  f.frequency.setValueAtTime(400, t);
+  f.frequency.exponentialRampToValueAtTime(2500, t + len);
+  const g = ac.createGain();
+  g.gain.setValueAtTime(0.2, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + len);
+  s.connect(f).connect(g).connect(ac.destination);
+  s.start(t);
+}
+
+function sfxPowerUp() {
+  if (!ac) return;
+  const t = ac.currentTime;
+  // Quick rising arpeggio.
+  [523, 659, 784, 1047].forEach((freq, i) => {
+    const o = ac.createOscillator();
+    const g = ac.createGain();
+    o.type = 'square';
+    o.frequency.value = freq;
+    const start = t + i * 0.06;
+    g.gain.setValueAtTime(0.06, start);
+    g.gain.exponentialRampToValueAtTime(0.001, start + 0.1);
+    o.connect(g).connect(ac.destination);
+    o.start(start);
+    o.stop(start + 0.11);
+  });
+}
+
+function sfxSplat() {
+  if (!ac) return;
+  const t = ac.currentTime;
+  // A wet thud: falling-pitch body plus a short muffled noise slap.
+  const o = ac.createOscillator();
+  const og = ac.createGain();
+  o.type = 'sine';
+  o.frequency.setValueAtTime(180, t);
+  o.frequency.exponentialRampToValueAtTime(35, t + 0.18);
+  og.gain.setValueAtTime(0.5, t);
+  og.gain.exponentialRampToValueAtTime(0.001, t + 0.2);
+  o.connect(og).connect(ac.destination);
+  o.start(t);
+  o.stop(t + 0.22);
+
+  const len = 0.12;
+  const b = ac.createBuffer(1, ac.sampleRate * len, ac.sampleRate);
+  const d = b.getChannelData(0);
+  for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  const s = ac.createBufferSource();
+  s.buffer = b;
+  const f = ac.createBiquadFilter();
+  f.type = 'bandpass';
+  f.frequency.setValueAtTime(1200, t);
+  f.frequency.exponentialRampToValueAtTime(300, t + len);
+  const ng = ac.createGain();
+  ng.gain.setValueAtTime(0.35, t);
+  ng.gain.exponentialRampToValueAtTime(0.001, t + len);
+  s.connect(f).connect(ng).connect(ac.destination);
+  s.start(t);
+}
+
+// ---------- World ----------
+const players = [
+  { name: 'RED', dir: 1, startX: 40, startAngle: 0, hud: '#f55', color: '#e33',
+    sprite: makeSprite('#e33', '#922'),
+    keys: { throttle: 'KeyW', pull: 'KeyA', push: 'KeyD', fire: 'KeyS' } },
+  { name: 'BLUE', dir: -1, startX: 280, startAngle: Math.PI, hud: '#6af', color: '#38f',
+    sprite: makeSprite('#38f', '#139'),
+    keys: { throttle: 'ArrowUp', pull: 'ArrowRight', push: 'ArrowLeft', fire: 'KeyM' } },
+];
+
+const HUT = { x: W / 2 - 10, y: GROUND - 18, w: 20, h: 18 };
+const clouds = [
+  { x: 60, y: 45, s: 4 },
+  { x: 190, y: 30, s: -3 },
+  { x: 260, y: 95, s: 5 },
+];
+const balloon = { t: 0, x: W / 2, y: 90, alive: true, respawn: 0 };
+
+// Each appearance gets its own random centre, drift range and phase.
+function placeBalloon() {
+  balloon.cx = 50 + Math.random() * (W - 100);
+  balloon.cy = 45 + Math.random() * 80;
+  // Keep the drift on screen.
+  balloon.ax = Math.min(30 + Math.random() * 60, balloon.cx - 15, W - 15 - balloon.cx);
+  balloon.ay = 10 + Math.random() * 25;
+  balloon.t = Math.random() * 100;
+  balloon.alive = true;
+  balloon.hp = BALLOON_HITS;
+  balloon.flash = 0;
+}
+placeBalloon();
+let bullets = [];
+let particles = [];
+let pilots = [];
+let missiles = [];
+const gull = { alive: false, timer: GULL_MIN_DELAY };
+const game = { state: 'title', winner: null };
+
+function resetPlane(p) {
+  p.x = p.startX;
+  p.y = GROUND - 4;
+  p.angle = p.startAngle;
+  p.speed = 0;
+  p.fallVy = 0;
+  p.onGround = true;
+  p.state = 'alive';
+  p.cooldown = 0;
+  p.respawn = 0;
+  p.heat = 0;
+  p.jammed = false;
+  p.throttleOn = false;
+  p.stallWarn = 0;
+  p.rapid = 0;
+}
+
+function startGame() {
+  players.forEach(p => { p.score = 0; resetPlane(p); });
+  bullets = [];
+  particles = [];
+  pilots = [];
+  missiles = [];
+  resetGull();
+  placeBalloon();
+  game.state = 'play';
+  game.winner = null;
+}
+
+players.forEach(p => { p.score = 0; resetPlane(p); });
+
+// ---------- Helpers ----------
+const wrapDx = (a, b) => { const dx = Math.abs(a - b) % W; return Math.min(dx, W - dx); };
+const dist = (ax, ay, bx, by) => Math.hypot(wrapDx(ax, bx), ay - by);
+
+function normAngle(a) {
+  while (a > Math.PI) a -= Math.PI * 2;
+  while (a < -Math.PI) a += Math.PI * 2;
+  return a;
+}
+
+function rotateToward(p, target, rate, dt) {
+  const diff = normAngle(target - p.angle);
+  p.angle += Math.sign(diff) * Math.min(Math.abs(diff), rate * dt);
+}
+
+function inHut(x, y) {
+  return x > HUT.x - 2 && x < HUT.x + HUT.w + 2 && y > HUT.y - 2;
+}
+
+function burst(x, y, n, colors, speed, life) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const v = Math.random() * speed;
+    particles.push({
+      x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v - speed * 0.3,
+      life: life * (0.5 + Math.random() * 0.5), color: colors[i % colors.length], grav: 60,
+    });
+  }
+}
+
+function other(p) { return players[0] === p ? players[1] : players[0]; }
+
+function score(p) {
+  p.score++;
+  if (p.score >= WIN_SCORE) { game.state = 'over'; game.winner = p; }
+}
+
+function explode(p, awardOpponent) {
+  burst(p.x, p.y, 40, ['#ff0', '#f80', '#f30', '#fff', '#555'], 70, 1.2);
+  sfxBoom();
+  if (awardOpponent) score(other(p));
+  p.state = 'dead';
+  p.respawn = RESPAWN;
+}
+
+function shotDown(p, shooter) {
+  score(shooter);
+  p.state = 'dying';
+  burst(p.x, p.y, 10, ['#ff0', '#f80'], 40, 0.5);
+  sfxBoom(0.3, 0.2);
+  bailOut(p);
+}
+
+// ---------- Seagull & missiles ----------
+function spawnGull() {
+  gull.alive = true;
+  gull.dir = Math.random() < 0.5 ? 1 : -1;
+  gull.x = gull.dir > 0 ? -10 : W + 10;
+  gull.baseY = 30 + Math.random() * 100;
+  gull.y = gull.baseY;
+  gull.t = 0;
+}
+
+function resetGull() {
+  gull.alive = false;
+  gull.timer = GULL_MIN_DELAY + Math.random() * (GULL_MAX_DELAY - GULL_MIN_DELAY);
+}
+
+function updateGull(dt) {
+  if (!gull.alive) {
+    if ((gull.timer -= dt) <= 0) spawnGull();
+    return;
+  }
+  gull.t += dt;
+  gull.x += gull.dir * GULL_SPEED * dt;
+  gull.y = gull.baseY + Math.sin(gull.t * 1.5) * 6;
+  if (gull.x < -15 || gull.x > W + 15) resetGull();
+}
+
+function shootGull(by) {
+  burst(gull.x, gull.y, 14, ['#fff', '#ddd', '#999'], 35, 0.9);
+  sfxSquawk();
+  resetGull();
+  if (by.state === 'alive') launchMissile(by);
+}
+
+function launchMissile(p) {
+  missiles.push({ owner: p, x: p.x, y: p.y, angle: p.angle, fuel: MISSILE_FUEL, dead: false });
+  sfxLaunch();
+}
+
+function missileBoom(m) {
+  m.dead = true;
+  burst(m.x, m.y, 20, ['#ff0', '#f80', '#fff'], 50, 0.7);
+  sfxBoom(0.4, 0.25);
+}
+
+function updateMissiles(dt) {
+  for (const m of missiles) {
+    if (m.dead) continue;
+    m.fuel -= dt;
+    if (m.fuel <= 0) { missileBoom(m); continue; }
+
+    // Steer toward the target by the shortest way around the wrapping screen.
+    const t = other(m.owner);
+    // Once the target is gone (shot down, crashed or landed), the missile gives up and dives into the ground.
+    if (t.state !== 'alive' || t.onGround) m.lost = true;
+    const targetable = !m.lost;
+    if (m.lost) {
+      rotateToward(m, -Math.PI / 2, MISSILE_TURN, dt);
+    } else {
+      let dx = t.x - m.x;
+      if (dx > W / 2) dx -= W;
+      if (dx < -W / 2) dx += W;
+      const diff = normAngle(Math.atan2(m.y - t.y, dx) - m.angle);
+      m.angle = normAngle(m.angle + Math.sign(diff) * Math.min(Math.abs(diff), MISSILE_TURN * dt));
+    }
+
+    m.x += Math.cos(m.angle) * MISSILE_SPEED * dt;
+    m.y -= Math.sin(m.angle) * MISSILE_SPEED * dt;
+    if (m.x < 0) m.x += W;
+    if (m.x >= W) m.x -= W;
+    if (m.y < 2) m.y = 2;
+    if (Math.random() < 0.7) {
+      particles.push({ x: m.x, y: m.y, vx: 0, vy: -3, life: 0.4, color: Math.random() < 0.5 ? '#bbb' : '#888', grav: 0 });
+    }
+
+    if (m.y > GROUND - 1 || inHut(m.x, m.y)) { missileBoom(m); continue; }
+    if (game.state === 'play' && targetable && dist(m.x, m.y, t.x, t.y) < 6) {
+      missileBoom(m);
+      shotDown(t, m.owner);
+    }
+  }
+  missiles = missiles.filter(m => !m.dead);
+}
+
+// ---------- Pilots ----------
+// state: 'falling' (alive, chute opens after CHUTE_DELAY), 'shot' (dead, dropping), 'landed', 'gone'
+function bailOut(p) {
+  pilots.push({
+    owner: p, x: p.x, y: p.y - 3, t: 0, state: 'falling', chute: false,
+    vx: Math.cos(p.angle) * p.speed * 0.3, vy: -25,
+  });
+}
+
+function pilotHit(pl, by) {
+  pl.state = 'shot';
+  pl.chute = false;
+  pl.vy = Math.max(pl.vy, 0);
+  burst(pl.x, pl.y - 8, 8, ['#fff', pl.owner.color], 30, 0.6);
+  sfxBoom(0.15, 0.15);
+  score(by);
+}
+
+function updatePilots(dt) {
+  for (const pl of pilots) {
+    pl.t += dt;
+    if (pl.state === 'landed') {
+      if ((pl.life -= dt) <= 0) pl.state = 'gone';
+      continue;
+    }
+    pl.chute = pl.state === 'falling' && pl.t > CHUTE_DELAY;
+    if (pl.chute) {
+      pl.vy += (CHUTE_SPEED - pl.vy) * Math.min(1, 3 * dt);
+      pl.vx *= 1 - Math.min(1, 2 * dt);
+      pl.x += Math.sin(pl.t * 2) * 6 * dt;
+    } else {
+      pl.vy += GRAVITY * dt;
+    }
+    pl.x += pl.vx * dt;
+    pl.y += pl.vy * dt;
+    if (pl.x < 0) pl.x += W;
+    if (pl.x >= W) pl.x -= W;
+
+    if (pl.y >= GROUND - 1) {
+      pl.y = GROUND - 1;
+      if (pl.state === 'falling' && pl.vy < SAFE_LANDING_SPEED) {
+        pl.state = 'landed';
+        pl.life = LANDED_TIME;
+      } else {
+        pl.state = 'gone';
+        burst(pl.x, pl.y, 6, ['#6b4a2a', '#3a7a2a'], 20, 0.5);
+        sfxSplat();
+      }
+    }
+
+    // Once the chute is open the enemy can shoot the pilot down or fly straight through it.
+    const enemy = other(pl.owner);
+    if (pl.chute && game.state === 'play' && enemy.state === 'alive' && !enemy.onGround
+      && dist(enemy.x, enemy.y, pl.x, pl.y - 4) < 7) {
+      pilotHit(pl, enemy);
+    }
+  }
+  pilots = pilots.filter(pl => pl.state !== 'gone');
+}
+
+// ---------- Update ----------
+function updatePlane(p, dt) {
+  if (p.state === 'dead') {
+    p.respawn -= dt;
+    // A new plane only appears once the pilot has landed or been killed.
+    if (p.respawn <= 0 && !pilots.some(pl => pl.owner === p)) resetPlane(p);
+    return;
+  }
+
+  p.cooldown -= dt;
+  p.rapid = Math.max(0, p.rapid - dt);
+  p.heat = Math.max(0, p.heat - (p.jammed ? JAMMED_COOL_RATE : COOL_RATE) * dt);
+  if (p.jammed && p.heat === 0) p.jammed = false;
+
+  if (p.state === 'dying') {
+    p.speed = Math.max(25, p.speed - DRAG * dt);
+    rotateToward(p, -Math.PI / 2, 1.2, dt);
+    p.fallVy += GRAVITY * 0.5 * dt;
+    if (Math.random() < 0.6) {
+      particles.push({ x: p.x, y: p.y, vx: 0, vy: -8, life: 0.8, color: Math.random() < 0.5 ? '#444' : '#777', grav: 0 });
+    }
+  } else {
+    const k = p.keys;
+    const turn = (keys.has(k.pull) ? 1 : 0) - (keys.has(k.push) ? 1 : 0);
+    const throttle = p.throttleOn;
+    p.angle = normAngle(p.angle + turn * p.dir * TURN * dt);
+
+    // Guns only work once airborne.
+    if (keys.has(k.fire) && p.cooldown <= 0 && !p.jammed && !p.onGround) {
+      if (p.rapid > 0) {
+        p.cooldown = RAPID_FIRE_DELAY;
+      } else {
+        p.cooldown = FIRE_DELAY;
+        p.heat += HEAT_PER_SHOT;
+        if (p.heat >= 1) { p.heat = 1; p.jammed = true; }
+      }
+      const c = Math.cos(p.angle), s = -Math.sin(p.angle);
+      bullets.push({
+        x: p.x + c * 9, y: p.y + s * 9,
+        vx: c * (BULLET_SPEED + p.speed), vy: s * (BULLET_SPEED + p.speed),
+        life: BULLET_LIFE, owner: p,
+      });
+      sfxShot();
+    }
+
+    if (p.onGround) {
+      p.speed += (throttle ? GROUND_ACCEL : -GROUND_FRICTION) * dt;
+      p.speed = Math.max(0, Math.min(MAX_SPEED, p.speed));
+      const level = Math.cos(p.angle) >= 0 ? 0 : Math.PI;
+      // Can't nose into the ground, and can't lift off below take-off speed.
+      if (Math.sin(p.angle) < 0 || p.speed < TAKEOFF) p.angle = level;
+      if (Math.sin(p.angle) > 0.05) p.onGround = false;
+      p.stallWarn = 0;
+    } else {
+      p.speed += (throttle ? ACCEL : -DRAG) * dt - GRAVITY * Math.sin(p.angle) * dt;
+      p.speed = Math.max(0, Math.min(MAX_SPEED, p.speed));
+      // 0 at a safe speed, rising to 1 at the stall: drives the engine cough and wing wobble.
+      p.stallWarn = Math.max(0, Math.min(1, (STALL * 1.5 - p.speed) / (STALL * 0.5)));
+      if (p.speed < STALL) {
+        p.fallVy += GRAVITY * dt;
+        rotateToward(p, -Math.PI / 2, 1.6, dt);
+        if (Math.random() < 0.15) {
+          particles.push({ x: p.x, y: p.y, vx: 0, vy: -5, life: 0.5, color: '#999', grav: 0 });
+        }
+      } else {
+        p.fallVy = Math.max(0, p.fallVy - GRAVITY * 2 * dt);
+      }
+    }
+  }
+
+  p.x += Math.cos(p.angle) * p.speed * dt;
+  if (!p.onGround) p.y += -Math.sin(p.angle) * p.speed * dt + p.fallVy * dt;
+  if (p.x < 0) p.x += W;
+  if (p.x >= W) p.x -= W;
+  if (p.y < 4) p.y = 4;
+
+  // Flying into the balloon pops it and the plane flies on unharmed, but only shooting it earns rapid fire.
+  if (balloon.alive && dist(p.x, p.y, balloon.x, balloon.y) < 8) popBalloon(null);
+
+  if ((!p.onGround && p.y > GROUND - 3) || inHut(p.x, p.y + 2)) explode(p, p.state === 'alive');
+}
+
+function popBalloon(by) {
+  balloon.alive = false;
+  balloon.respawn = BALLOON_MIN_DELAY + Math.random() * (BALLOON_MAX_DELAY - BALLOON_MIN_DELAY);
+  burst(balloon.x, balloon.y, 20, ['#e22', '#fff', '#a00'], 50, 0.8);
+  sfxBoom(0.25, 0.25);
+  if (by && by.state === 'alive') {
+    by.rapid = RAPID_TIME;
+    by.heat = 0;
+    by.jammed = false;
+    sfxPowerUp();
+  }
+}
+
+function update(dt) {
+  for (const c of clouds) {
+    c.x += c.s * dt;
+    if (c.x < -30) c.x += W + 60;
+    if (c.x > W + 30) c.x -= W + 60;
+  }
+
+  balloon.t += dt;
+  balloon.x = balloon.cx + Math.sin(balloon.t * 0.13) * balloon.ax;
+  balloon.y = balloon.cy + Math.sin(balloon.t * 0.4) * balloon.ay;
+  if (!balloon.alive && (balloon.respawn -= dt) <= 0) placeBalloon();
+  balloon.flash = Math.max(0, balloon.flash - dt);
+
+  if (game.state === 'play') {
+    players.forEach(p => updatePlane(p, dt));
+
+    const [a, b] = players;
+    if (a.state === 'alive' && b.state === 'alive' && dist(a.x, a.y, b.x, b.y) < PLANE_COLLIDE) {
+      explode(a, false);
+      explode(b, false);
+      bailOut(a);
+      bailOut(b);
+    }
+  }
+  updatePilots(dt);
+  updateGull(dt);
+  updateMissiles(dt);
+
+  for (const bl of bullets) {
+    bl.x += bl.vx * dt;
+    bl.y += bl.vy * dt;
+    bl.life -= dt;
+    if (bl.x < 0) bl.x += W;
+    if (bl.x >= W) bl.x -= W;
+    if (bl.y < 0 || bl.y > GROUND || inHut(bl.x, bl.y)) bl.life = 0;
+    if (bl.life <= 0) continue;
+
+    const target = other(bl.owner);
+    const pilot = game.state === 'play'
+      && pilots.find(pl => pl.chute && pl.owner === target && dist(bl.x, bl.y, pl.x, pl.y - 4) < 6);
+    // Planes still on the runway are protected, so nobody can be spawn-camped.
+    if (game.state === 'play' && target.state === 'alive' && !target.onGround && dist(bl.x, bl.y, target.x, target.y) < 6) {
+      bl.life = 0;
+      shotDown(target, bl.owner);
+    } else if (pilot) {
+      bl.life = 0;
+      pilotHit(pilot, bl.owner);
+    } else if (gull.alive && dist(bl.x, bl.y, gull.x, gull.y) < 5) {
+      bl.life = 0;
+      shootGull(bl.owner);
+    } else if (missiles.some(m => !m.dead && m.owner !== bl.owner && dist(bl.x, bl.y, m.x, m.y) < 4)) {
+      bl.life = 0;
+      missileBoom(missiles.find(m => !m.dead && m.owner !== bl.owner && dist(bl.x, bl.y, m.x, m.y) < 4));
+    } else if (balloon.alive && dist(bl.x, bl.y, balloon.x, balloon.y) < 7) {
+      bl.life = 0;
+      if (--balloon.hp <= 0) {
+        popBalloon(bl.owner);
+      } else {
+        balloon.flash = 0.08;
+        burst(bl.x, bl.y, 3, ['#fff', '#e22'], 20, 0.3);
+        sfxHit();
+      }
+    }
+  }
+  bullets = bullets.filter(bl => bl.life > 0);
+
+  for (const pt of particles) {
+    pt.vy += pt.grav * dt;
+    pt.x += pt.vx * dt;
+    pt.y += pt.vy * dt;
+    pt.life -= dt;
+    if (pt.y > GROUND) { pt.y = GROUND; pt.vy *= -0.3; pt.vx *= 0.5; }
+  }
+  particles = particles.filter(pt => pt.life > 0);
+
+  updateEngines();
+}
+
+// ---------- Draw ----------
+function blob(cx, cy, rx, ry, color) {
+  ctx.fillStyle = color;
+  for (let y = -ry; y <= ry; y++) {
+    const w = Math.round(rx * Math.sqrt(1 - (y * y) / (ry * ry)));
+    ctx.fillRect(Math.round(cx - w), Math.round(cy + y), w * 2, 1);
+  }
+}
+
+function drawSky() {
+  // Copper-bar style banded gradient.
+  const top = [26, 42, 108], bottom = [150, 200, 230];
+  for (let y = 0; y < GROUND; y += 6) {
+    const t = y / GROUND;
+    const c = top.map((v, i) => Math.round(v + (bottom[i] - v) * t));
+    ctx.fillStyle = `rgb(${c})`;
+    ctx.fillRect(0, y, W, 6);
+  }
+}
+
+function drawGround() {
+  ctx.fillStyle = '#3a7a2a';
+  ctx.fillRect(0, GROUND, W, H - GROUND);
+  ctx.fillStyle = '#2a5a1e';
+  for (let x = 0; x < W; x += 7) ctx.fillRect(x, GROUND, 2, 1);
+  ctx.fillStyle = '#6b4a2a';
+  ctx.fillRect(0, H - 6, W, 6);
+}
+
+function drawHut() {
+  const { x, y, w, h } = HUT;
+  ctx.fillStyle = '#a0643a';
+  ctx.fillRect(x + 2, y + 7, w - 4, h - 7);
+  ctx.fillStyle = '#c33';
+  for (let i = 0; i < 8; i++) ctx.fillRect(x + 8 - i * 1.25, y + i, 4 + i * 2.5, 1);
+  ctx.fillStyle = '#3a2210';
+  ctx.fillRect(x + 8, y + 11, 4, 7);
+  ctx.fillStyle = '#ffd';
+  ctx.fillRect(x + 3, y + 10, 3, 3);
+  ctx.fillRect(x + 14, y + 10, 3, 3);
+}
+
+function drawCloud(c) {
+  for (const ox of [0, -W - 60, W + 60]) {
+    const x = c.x + ox;
+    if (x < -40 || x > W + 40) continue;
+    blob(x, c.y + 2, 24, 7, '#c8d4e8');
+    blob(x - 12, c.y, 12, 7, '#fff');
+    blob(x + 10, c.y - 1, 14, 8, '#fff');
+    blob(x, c.y - 5, 11, 7, '#fff');
+  }
+}
+
+function drawBalloon() {
+  if (!balloon.alive) return;
+  const x = Math.round(balloon.x), y = Math.round(balloon.y);
+  ctx.fillStyle = '#222';
+  ctx.fillRect(x - 3, y + 6, 1, 5);
+  ctx.fillRect(x + 3, y + 6, 1, 5);
+  ctx.fillStyle = '#7a4a1a';
+  ctx.fillRect(x - 3, y + 11, 7, 3);
+  blob(x, y, 6, 7, balloon.flash > 0 ? '#fff' : '#d22');
+  // Patches show the hits it has taken.
+  ctx.fillStyle = '#811';
+  for (let i = 0; i < BALLOON_HITS - balloon.hp; i++) ctx.fillRect(x - 3 + (i * 3) % 7, y - 1 + ((i * 5) % 6), 2, 2);
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(x - 3, y - 4, 2, 2);
+}
+
+function drawPlane(p) {
+  if (p.state === 'dead') return;
+  const wobble = p.state === 'alive' ? p.stallWarn * Math.sin(performance.now() / 40) * 0.12 : 0;
+  for (const ox of [0, -W, W]) {
+    const x = p.x + ox;
+    if (x < -10 || x > W + 10) continue;
+    ctx.save();
+    ctx.translate(Math.round(x), Math.round(p.y));
+    ctx.rotate(-p.angle + wobble);
+    if (p.dir < 0) ctx.scale(1, -1);
+    ctx.drawImage(p.sprite, -8, -5);
+    ctx.restore();
+  }
+}
+
+function drawPilot(pl) {
+  const x = Math.round(pl.x), y = Math.round(pl.y);
+  if (pl.chute) {
+    // Striped canopy with rigging lines down to the pilot's shoulders.
+    const rows = [7, 11, 13, 13];
+    rows.forEach((w, i) => {
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(x - (w >> 1), y - 16 + i, w, 1);
+      ctx.fillStyle = pl.owner.color;
+      ctx.fillRect(x - 3, y - 16 + i, 2, 1);
+      ctx.fillRect(x + 2, y - 16 + i, 2, 1);
+    });
+    ctx.fillStyle = '#ddd';
+    for (let i = 1; i < 9; i++) {
+      ctx.fillRect(Math.round(x - 6 + i * 5 / 9), y - 12 + i, 1, 1);
+      ctx.fillRect(Math.round(x + 6 - i * 5 / 9), y - 12 + i, 1, 1);
+    }
+  }
+  ctx.fillStyle = '#fc9';
+  ctx.fillRect(x, y - 4, 1, 1);
+  ctx.fillStyle = pl.owner.color;
+  ctx.fillRect(x - 1, y - 3, 3, 2);
+  ctx.fillStyle = '#222';
+  ctx.fillRect(x - 1, y - 1, 1, 1);
+  ctx.fillRect(x + 1, y - 1, 1, 1);
+  if (pl.state === 'landed' && Math.floor(pl.t * 4) % 2) {
+    // Waving to the crowd.
+    ctx.fillStyle = '#fc9';
+    ctx.fillRect(x - 2, y - 5, 1, 1);
+    ctx.fillRect(x + 2, y - 5, 1, 1);
+  }
+}
+
+function drawGull() {
+  if (!gull.alive) return;
+  const x = Math.round(gull.x), y = Math.round(gull.y);
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(x - 2, y, 5, 2);
+  ctx.fillStyle = '#f90';
+  ctx.fillRect(x + 3 * gull.dir, y, 1, 1);
+  // Two-frame wing flap: wings swept up, then down.
+  const up = Math.floor(gull.t * 6) % 2 === 0;
+  for (const side of [-1, 1]) {
+    ctx.fillStyle = '#eee';
+    if (up) {
+      ctx.fillRect(x + side * 3, y - 1, 1, 1);
+      ctx.fillRect(x + side * 4, y - 2, 1, 1);
+      ctx.fillStyle = '#888';
+      ctx.fillRect(x + side * 5, y - 3, 1, 1);
+    } else {
+      ctx.fillRect(x + side * 3, y + 1, 1, 1);
+      ctx.fillRect(x + side * 4, y + 1, 1, 1);
+      ctx.fillStyle = '#888';
+      ctx.fillRect(x + side * 5, y + 2, 1, 1);
+    }
+  }
+}
+
+function drawMissile(m) {
+  ctx.save();
+  ctx.translate(Math.round(m.x), Math.round(m.y));
+  ctx.rotate(-m.angle);
+  ctx.fillStyle = '#ccc';
+  ctx.fillRect(-3, 0, 5, 1);
+  ctx.fillStyle = '#888';
+  ctx.fillRect(-3, -1, 1, 1);
+  ctx.fillRect(-3, 1, 1, 1);
+  // The tip flashes white when the fuel is nearly gone.
+  ctx.fillStyle = m.fuel < 2 && Math.floor(m.fuel * 8) % 2 ? '#fff' : '#e22';
+  ctx.fillRect(2, 0, 1, 1);
+  ctx.restore();
+}
+
+function drawText(text, x, y, size, color, align = 'center') {
+  sctx.font = `${size}px 'Press Start 2P', monospace`;
+  sctx.textAlign = align;
+  sctx.fillStyle = '#000';
+  sctx.fillText(text, x + 3, y + 3);
+  sctx.fillStyle = color;
+  sctx.fillText(text, x, y);
+}
+
+function drawHeat(p, x) {
+  const y = 58, w = 120, h = 8;
+  sctx.fillStyle = '#000';
+  sctx.fillRect(x, y, w, h);
+  const blink = Math.floor(performance.now() / 150) % 2;
+  if (p.rapid > 0) {
+    // While rapid fire lasts, the bar shows the time remaining instead of heat.
+    sctx.fillStyle = blink ? '#4ff' : '#0aa';
+    sctx.fillRect(x + 1, y + 1, (w - 2) * (p.rapid / RAPID_TIME), h - 2);
+    drawText('RAPID FIRE', x + w / 2, y + 28, 12, '#4ff');
+  } else {
+    sctx.fillStyle = p.jammed ? (blink ? '#f22' : '#800') : p.heat > 0.7 ? '#f80' : '#fc4';
+    sctx.fillRect(x + 1, y + 1, (w - 2) * p.heat, h - 2);
+    if (p.jammed) drawText('JAMMED', x + w / 2, y + 28, 12, '#f44');
+  }
+  if (p.state !== 'dead') drawText(p.throttleOn ? 'ENGINE ON' : 'ENGINE OFF', x + w / 2, y + 50, 10, p.throttleOn ? '#6f6' : '#888');
+  const m = missiles.find(mm => mm.owner === p);
+  if (m) drawText(`MISSILE ${Math.ceil(m.fuel)}`, x + w / 2, y + 70, 10, '#f80');
+}
+
+function draw() {
+  drawSky();
+  drawGround();
+  drawHut();
+  drawBalloon();
+  players.forEach(drawPlane);
+  pilots.forEach(drawPilot);
+  drawGull();
+  missiles.forEach(drawMissile);
+  ctx.fillStyle = '#ff8';
+  for (const bl of bullets) ctx.fillRect(Math.round(bl.x), Math.round(bl.y), 1, 1);
+  for (const pt of particles) {
+    ctx.fillStyle = pt.color;
+    ctx.fillRect(Math.round(pt.x), Math.round(pt.y), 1, 1);
+  }
+  clouds.forEach(drawCloud);
+
+  sctx.drawImage(buf, 0, 0, 960, 600);
+
+  const [a, b] = players;
+  drawText(`${a.name} ${a.score}`, 24, 44, 20, a.hud, 'left');
+  drawText(`${b.score} ${b.name}`, 960 - 24, 44, 20, b.hud, 'right');
+  if (game.state === 'play') {
+    drawHeat(a, 24);
+    drawHeat(b, 960 - 24 - 120);
+  }
+
+  if (game.state === 'title') {
+    drawText('BIP', 480, 250, 64, '#ff0');
+    drawText(`FIRST TO ${WIN_SCORE}`, 480, 320, 20, '#fff');
+    drawText('PRESS SPACE', 480, 370, 20, '#fff');
+  } else if (game.state === 'over') {
+    drawText(`${game.winner.name} WINS!`, 480, 270, 40, game.winner.hud);
+    drawText('PRESS SPACE', 480, 340, 20, '#fff');
+  }
+}
+
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min((now - last) / 1000, 1 / 30);
+  last = now;
+  update(dt);
+  draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
