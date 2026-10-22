@@ -634,9 +634,6 @@ function updatePlane(p, dt) {
   if (p.x >= W) p.x -= W;
   if (p.y < 4) p.y = 4;
 
-  // Flying into the balloon pops it and the plane flies on unharmed, but only shooting it earns rapid fire.
-  if (balloon.alive && dist(p.x, p.y, balloon.x, balloon.y) < 8) popBalloon(null);
-
   if ((!p.onGround && p.y > GROUND - 3) || inHut(p.x, p.y + 2)) explode(p, p.state === 'alive');
 }
 
