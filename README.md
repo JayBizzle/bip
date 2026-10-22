@@ -6,7 +6,7 @@ A two-player biplane dogfight for the browser. It's a remake of *Biplane Duel* (
 
 ## Play
 
-Open `index.html` in a browser and press **Space**. There's no build step and nothing to install.
+**[Play it online](https://jaybizzle.github.io/bip/)**, or open `index.html` in a browser. Press **Space** to start. There's no build step and nothing to install.
 
 ## Controls
 
