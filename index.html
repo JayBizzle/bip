@@ -19,7 +19,7 @@
   }
   canvas {
     /* Fill as much of the window as the 16:10 aspect ratio allows, leaving room for the key legend. */
-    width: min(calc(100vw - 40px), calc((100vh - 170px) * 1.6));
+    width: min(calc(100vw - 40px), calc((100vh - 220px) * 1.6));
     aspect-ratio: 320 / 200;
     image-rendering: pixelated;
     border: 4px solid #444;
@@ -27,13 +27,26 @@
   .keys { display: flex; gap: 48px; font-size: 10px; line-height: 2; }
   .p1 { color: #f55; }
   .p2 { color: #6af; }
+  .online { display: flex; align-items: center; gap: 12px; font-size: 10px; line-height: 2; text-align: center; flex-wrap: wrap; justify-content: center; }
+  .online button, .online input { font: inherit; background: #222; color: #ff0; border: 2px solid #444; padding: 6px 10px; }
+  .online button { cursor: pointer; }
+  .online button:hover { border-color: #ff0; }
+  .online input { color: #ccc; width: 34ch; }
+  [hidden] { display: none !important; }
 </style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.4/peerjs.min.js"></script>
 </head>
 <body>
 <canvas id="screen" width="1920" height="1200"></canvas>
-<div class="keys">
+<div class="keys" id="keys">
   <div class="p1">PLAYER 1<br>W throttle on/off<br>A loop back<br>D loop forward<br>S fire</div>
   <div class="p2">PLAYER 2<br>&uarr; throttle on/off<br>&rarr; loop back<br>&larr; loop forward<br>M fire</div>
+</div>
+<div class="online">
+  <button id="host-btn">PLAY ONLINE</button>
+  <span id="status"></span>
+  <input id="link" readonly hidden>
+  <button id="copy-btn" hidden>COPY</button>
 </div>
 <script>
 // Game runs in a 320x200 buffer (Amiga lowres) and is scaled up 6x.
@@ -98,15 +111,30 @@ addEventListener('keydown', e => {
   if (e.code.startsWith('Arrow') || e.code === 'Space') e.preventDefault();
   keys.add(e.code);
   initAudio();
-  if (!e.repeat && game.state === 'play') {
-    for (const p of players) {
-      if (e.code === p.keys.throttle && p.state === 'alive') p.throttleOn = !p.throttleOn;
-    }
+  if (!e.repeat && players.some(p => e.code === p.keys.throttle)) {
+    // Online, either throttle key works your own plane.
+    toggleThrottle(net.mode === 'local' ? players.find(p => e.code === p.keys.throttle) : players[net.me]);
   }
-  if (e.code === 'Space' && game.state !== 'play') startGame();
+  if (e.code === 'Space' && game.state !== 'play') {
+    if (net.mode === 'guest') net.conn.send({ t: 'start' });
+    else startGame();
+  }
 });
 addEventListener('keyup', e => keys.delete(e.code));
 addEventListener('blur', () => keys.clear());
+
+function toggleThrottle(p) {
+  if (net.mode === 'guest') net.conn.send({ t: 'throttle' });
+  else if (game.state === 'play' && p.state === 'alive') p.throttleOn = !p.throttleOn;
+}
+
+// Online, each player flies their own plane with either set of keys, and the host
+// reads the guest's plane from the controls the guest last sent.
+function held(p, action) {
+  if (net.mode === 'local') return keys.has(p.keys[action]);
+  if (p !== players[net.me]) return !!net.remote[action];
+  return players.some(q => keys.has(q.keys[action]));
+}
 
 // ---------- Audio ----------
 let ac = null;
@@ -144,6 +172,7 @@ function updateEngines() {
 }
 
 function sfxShot() {
+  record('sfxShot', arguments);
   if (!ac) return;
   const t = ac.currentTime;
   const o = ac.createOscillator();
@@ -159,6 +188,7 @@ function sfxShot() {
 }
 
 function sfxBoom(dur = 0.8, vol = 0.3) {
+  record('sfxBoom', arguments);
   if (!ac) return;
   const t = ac.currentTime;
   const b = ac.createBuffer(1, ac.sampleRate * dur, ac.sampleRate);
@@ -178,6 +208,7 @@ function sfxBoom(dur = 0.8, vol = 0.3) {
 }
 
 function sfxHit() {
+  record('sfxHit', arguments);
   if (!ac) return;
   const t = ac.currentTime;
   const o = ac.createOscillator();
@@ -193,6 +224,7 @@ function sfxHit() {
 }
 
 function sfxSquawk() {
+  record('sfxSquawk', arguments);
   if (!ac) return;
   const t0 = ac.currentTime;
   // Two harsh, warbling squawks.
@@ -225,6 +257,7 @@ function sfxSquawk() {
 }
 
 function sfxLaunch() {
+  record('sfxLaunch', arguments);
   if (!ac) return;
   const t = ac.currentTime, len = 0.5;
   const b = ac.createBuffer(1, ac.sampleRate * len, ac.sampleRate);
@@ -244,6 +277,7 @@ function sfxLaunch() {
 }
 
 function sfxPowerUp() {
+  record('sfxPowerUp', arguments);
   if (!ac) return;
   const t = ac.currentTime;
   // Quick rising arpeggio.
@@ -262,6 +296,7 @@ function sfxPowerUp() {
 }
 
 function sfxSplat() {
+  record('sfxSplat', arguments);
   if (!ac) return;
   const t = ac.currentTime;
   // A wet thud: falling-pitch body plus a short muffled noise slap.
@@ -382,6 +417,7 @@ function inHut(x, y) {
 }
 
 function burst(x, y, n, colors, speed, life) {
+  record('burst', arguments);
   for (let i = 0; i < n; i++) {
     const a = Math.random() * Math.PI * 2;
     const v = Math.random() * speed;
@@ -485,9 +521,6 @@ function updateMissiles(dt) {
     if (m.x < 0) m.x += W;
     if (m.x >= W) m.x -= W;
     if (m.y < 2) m.y = 2;
-    if (Math.random() < 0.7) {
-      particles.push({ x: m.x, y: m.y, vx: 0, vy: -3, life: 0.4, color: Math.random() < 0.5 ? '#bbb' : '#888', grav: 0 });
-    }
 
     if (m.y > GROUND - 1 || inHut(m.x, m.y)) { missileBoom(m); continue; }
     if (game.state === 'play' && targetable && dist(m.x, m.y, t.x, t.y) < 6) {
@@ -576,17 +609,13 @@ function updatePlane(p, dt) {
     p.speed = Math.max(25, p.speed - DRAG * dt);
     rotateToward(p, -Math.PI / 2, 1.2, dt);
     p.fallVy += GRAVITY * 0.5 * dt;
-    if (Math.random() < 0.6) {
-      particles.push({ x: p.x, y: p.y, vx: 0, vy: -8, life: 0.8, color: Math.random() < 0.5 ? '#444' : '#777', grav: 0 });
-    }
   } else {
-    const k = p.keys;
-    const turn = (keys.has(k.pull) ? 1 : 0) - (keys.has(k.push) ? 1 : 0);
+    const turn = (held(p, 'pull') ? 1 : 0) - (held(p, 'push') ? 1 : 0);
     const throttle = p.throttleOn;
     p.angle = normAngle(p.angle + turn * p.dir * TURN * dt);
 
     // Guns only work once airborne.
-    if (keys.has(k.fire) && p.cooldown <= 0 && !p.jammed && !p.onGround) {
+    if (held(p, 'fire') && p.cooldown <= 0 && !p.jammed && !p.onGround) {
       if (p.rapid > 0) {
         p.cooldown = RAPID_FIRE_DELAY;
       } else {
@@ -619,9 +648,6 @@ function updatePlane(p, dt) {
       if (p.speed < STALL) {
         p.fallVy += GRAVITY * dt;
         rotateToward(p, -Math.PI / 2, 1.6, dt);
-        if (Math.random() < 0.15) {
-          particles.push({ x: p.x, y: p.y, vx: 0, vy: -5, life: 0.5, color: '#999', grav: 0 });
-        }
       } else {
         p.fallVy = Math.max(0, p.fallVy - GRAVITY * 2 * dt);
       }
@@ -650,12 +676,43 @@ function popBalloon(by) {
   }
 }
 
-function update(dt) {
+// Smoke trails are only cosmetic, so the guest spawns its own from the state the host sends.
+function spawnTrails() {
+  for (const p of game.state === 'play' ? players : []) {
+    if (p.state === 'dying' && Math.random() < 0.6) {
+      particles.push({ x: p.x, y: p.y, vx: 0, vy: -8, life: 0.8, color: Math.random() < 0.5 ? '#444' : '#777', grav: 0 });
+    } else if (p.state === 'alive' && !p.onGround && p.speed < STALL && Math.random() < 0.15) {
+      particles.push({ x: p.x, y: p.y, vx: 0, vy: -5, life: 0.5, color: '#999', grav: 0 });
+    }
+  }
+  for (const m of missiles) {
+    if (Math.random() < 0.7) {
+      particles.push({ x: m.x, y: m.y, vx: 0, vy: -3, life: 0.4, color: Math.random() < 0.5 ? '#bbb' : '#888', grav: 0 });
+    }
+  }
+}
+
+function updateClouds(dt) {
   for (const c of clouds) {
     c.x += c.s * dt;
     if (c.x < -30) c.x += W + 60;
     if (c.x > W + 30) c.x -= W + 60;
   }
+}
+
+function updateParticles(dt) {
+  for (const pt of particles) {
+    pt.vy += pt.grav * dt;
+    pt.x += pt.vx * dt;
+    pt.y += pt.vy * dt;
+    pt.life -= dt;
+    if (pt.y > GROUND) { pt.y = GROUND; pt.vy *= -0.3; pt.vx *= 0.5; }
+  }
+  particles = particles.filter(pt => pt.life > 0);
+}
+
+function update(dt) {
+  updateClouds(dt);
 
   balloon.t += dt;
   balloon.x = balloon.cx + Math.sin(balloon.t * 0.13) * balloon.ax;
@@ -716,16 +773,18 @@ function update(dt) {
   }
   bullets = bullets.filter(bl => bl.life > 0);
 
-  for (const pt of particles) {
-    pt.vy += pt.grav * dt;
-    pt.x += pt.vx * dt;
-    pt.y += pt.vy * dt;
-    pt.life -= dt;
-    if (pt.y > GROUND) { pt.y = GROUND; pt.vy *= -0.3; pt.vx *= 0.5; }
-  }
-  particles = particles.filter(pt => pt.life > 0);
-
+  spawnTrails();
+  updateParticles(dt);
   updateEngines();
+}
+
+// The guest doesn't simulate the game, only the scenery and effects around the host's state.
+function updateGuest(dt) {
+  updateClouds(dt);
+  spawnTrails();
+  updateParticles(dt);
+  updateEngines();
+  sendInput(performance.now());
 }
 
 // ---------- Draw ----------
@@ -949,13 +1008,202 @@ function draw() {
     drawText(`${game.winner.name} WINS!`, 480, 270, 40, game.winner.hud);
     drawText('PRESS SPACE', 480, 340, 20, '#fff');
   }
+  if (game.state !== 'play' && net.mode !== 'local') {
+    const me = players[net.me];
+    drawText(`YOU ARE ${me.name}`, 480, 420, 20, me.hud);
+  }
 }
+
+// ---------- Online ----------
+// The host's browser runs the game and the guest's browser just draws it. The guest sends its
+// controls to the host, and the host sends back the game state plus the effects (bursts and
+// sounds) that happened since the last update, so the guest can replay them.
+const PEER_PREFIX = 'jaybizzle-bip-';
+const SEND_INTERVAL = 1000 / 60;
+// The guest resends its controls at least this often so the host knows it's still there,
+// and either side gives up on the other after TIMEOUT of silence.
+const HEARTBEAT = 1000, TIMEOUT = 5000;
+const net = { mode: 'local', me: 0, code: null, peer: null, conn: null, remote: {}, sentInput: '', events: [], lastSend: 0, lastHeard: 0 };
+const FX = { burst, sfxShot, sfxBoom, sfxHit, sfxSquawk, sfxLaunch, sfxPowerUp, sfxSplat };
+
+const hostBtn = document.getElementById('host-btn');
+const copyBtn = document.getElementById('copy-btn');
+const linkEl = document.getElementById('link');
+const statusEl = document.getElementById('status');
+const keysEl = document.getElementById('keys');
+
+function record(name, args) {
+  if (net.mode === 'host') net.events.push([name, ...args]);
+}
+
+function setStatus(text, color = '#ccc') {
+  statusEl.textContent = text;
+  statusEl.style.color = color;
+  linkEl.hidden = copyBtn.hidden = true;
+}
+
+function showLink(code) {
+  setStatus('SEND THIS LINK TO YOUR OPPONENT:');
+  linkEl.value = `${location.origin}${location.pathname}#join=${code}`;
+  linkEl.hidden = copyBtn.hidden = false;
+  copyBtn.textContent = 'COPY';
+}
+
+function hostGame() {
+  hostBtn.hidden = true;
+  setStatus('STARTING...');
+  const code = net.code = Math.random().toString(36).slice(2, 8);
+  const peer = net.peer = new Peer(PEER_PREFIX + code);
+  peer.on('open', () => showLink(code));
+  // Stay reachable if the connection to the matchmaking server blips.
+  peer.on('disconnected', () => { if (!peer.destroyed) peer.reconnect(); });
+  peer.on('connection', conn => {
+    // One opponent at a time.
+    if (net.conn) { conn.on('open', () => conn.close()); return; }
+    conn.on('open', () => connected(conn, 'host'));
+    conn.on('close', () => { if (net.conn === conn) disconnected(); });
+  });
+  peer.on('error', err => {
+    // Someone else already has this code, so pick another.
+    if (err.type === 'unavailable-id') { peer.destroy(); hostGame(); return; }
+    peerError(err);
+  });
+}
+
+function joinGame(code) {
+  hostBtn.hidden = true;
+  setStatus('CONNECTING...');
+  const peer = net.peer = new Peer();
+  peer.on('open', () => {
+    const conn = peer.connect(PEER_PREFIX + code, { serialization: 'json' });
+    conn.on('open', () => connected(conn, 'guest'));
+    conn.on('close', () => { if (net.conn === conn) disconnected(); });
+  });
+  peer.on('error', peerError);
+}
+
+function peerError(err) {
+  if (net.conn) return;
+  setStatus(err.type === 'peer-unavailable' ? 'GAME NOT FOUND. ASK FOR A NEW LINK.' : `CONNECTION FAILED (${err.type})`, '#f44');
+  net.peer?.destroy();
+  net.peer = null;
+  hostBtn.hidden = false;
+}
+
+function connected(conn, mode) {
+  net.conn = conn;
+  net.mode = mode;
+  net.me = mode === 'host' ? 0 : 1;
+  net.remote = {};
+  net.events = [];
+  net.sentInput = '';
+  net.lastHeard = performance.now();
+  conn.on('data', msg => {
+    net.lastHeard = performance.now();
+    (mode === 'host' ? receiveFromGuest : receiveFromHost)(msg);
+  });
+  players.forEach(p => { p.score = 0; resetPlane(p); });
+  bullets = [];
+  pilots = [];
+  missiles = [];
+  game.state = 'title';
+  keysEl.hidden = true;
+  const me = players[net.me];
+  setStatus(`CONNECTED! YOU ARE ${me.name}. FLY WITH WASD OR THE ARROW KEYS, FIRE WITH S OR M.`, me.hud);
+}
+
+// The host keeps listening on the same link, so the opponent can rejoin.
+function disconnected() {
+  const conn = net.conn, wasHost = net.mode === 'host';
+  net.conn = null;
+  net.mode = 'local';
+  conn.close();
+  game.state = 'title';
+  keysEl.hidden = false;
+  if (wasHost) {
+    showLink(net.code);
+    statusEl.textContent = 'OPPONENT LEFT. SEND THE LINK AGAIN:';
+  } else {
+    net.peer.destroy();
+    net.peer = null;
+    history.replaceState(null, '', location.pathname);
+    setStatus('LOST CONNECTION TO HOST.', '#f44');
+    hostBtn.hidden = false;
+  }
+}
+
+function receiveFromGuest(msg) {
+  if (msg.t === 'input') net.remote = msg;
+  else if (msg.t === 'throttle') toggleThrottle(players[1]);
+  else if (msg.t === 'start' && game.state !== 'play') startGame();
+}
+
+function sendInput(now) {
+  const input = { t: 'input', pull: held(players[1], 'pull'), push: held(players[1], 'push'), fire: held(players[1], 'fire') };
+  const json = JSON.stringify(input);
+  if (json === net.sentInput && now - net.lastSend < HEARTBEAT) return;
+  net.sentInput = json;
+  net.lastSend = now;
+  net.conn.send(input);
+}
+
+const r = v => Math.round(v * 100) / 100;
+
+function sendState(now) {
+  if (now - net.lastSend < SEND_INTERVAL - 2) return;
+  net.lastSend = now;
+  const idx = p => players.indexOf(p);
+  net.conn.send({
+    t: 'state',
+    game: { state: game.state, winner: game.winner ? idx(game.winner) : -1 },
+    players: players.map(p => ({
+      x: r(p.x), y: r(p.y), angle: r(p.angle), speed: r(p.speed), state: p.state, onGround: p.onGround,
+      throttleOn: p.throttleOn, stallWarn: r(p.stallWarn), heat: r(p.heat), jammed: p.jammed, rapid: r(p.rapid), score: p.score,
+    })),
+    bullets: bullets.map(bl => [r(bl.x), r(bl.y)]),
+    pilots: pilots.map(pl => ({ o: idx(pl.owner), x: r(pl.x), y: r(pl.y), t: r(pl.t), chute: pl.chute, state: pl.state })),
+    missiles: missiles.map(m => ({ o: idx(m.owner), x: r(m.x), y: r(m.y), angle: r(m.angle), fuel: r(m.fuel) })),
+    balloon: { x: r(balloon.x), y: r(balloon.y), alive: balloon.alive, hp: balloon.hp, flash: r(balloon.flash) },
+    gull: { alive: gull.alive, x: r(gull.x), y: r(gull.y), dir: gull.dir, t: r(gull.t) },
+    events: net.events,
+  });
+  net.events = [];
+}
+
+function receiveFromHost(s) {
+  if (s.t !== 'state') return;
+  game.state = s.game.state;
+  game.winner = players[s.game.winner] || null;
+  s.players.forEach((q, i) => Object.assign(players[i], q));
+  bullets = s.bullets.map(([x, y]) => ({ x, y }));
+  pilots = s.pilots.map(pl => ({ ...pl, owner: players[pl.o] }));
+  missiles = s.missiles.map(m => ({ ...m, owner: players[m.o] }));
+  Object.assign(balloon, s.balloon);
+  Object.assign(gull, s.gull);
+  for (const [name, ...args] of s.events) FX[name](...args);
+}
+
+hostBtn.addEventListener('click', () => { hostBtn.blur(); hostGame(); });
+copyBtn.addEventListener('click', () => {
+  copyBtn.blur();
+  navigator.clipboard.writeText(linkEl.value).then(() => { copyBtn.textContent = 'COPIED'; });
+});
+// Closing the tab tells the other side straight away instead of leaving it to time out.
+addEventListener('pagehide', () => net.conn?.close());
+const joinCode = location.hash.match(/^#join=(\w+)$/);
+if (joinCode) joinGame(joinCode[1]);
 
 let last = performance.now();
 function frame(now) {
   const dt = Math.min((now - last) / 1000, 1 / 30);
   last = now;
-  update(dt);
+  if (net.conn && now - net.lastHeard > TIMEOUT) disconnected();
+  if (net.mode === 'guest') {
+    updateGuest(dt);
+  } else {
+    update(dt);
+    if (net.mode === 'host') sendState(now);
+  }
   draw();
   requestAnimationFrame(frame);
 }

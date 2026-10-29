@@ -8,6 +8,12 @@ A two-player biplane dogfight for the browser. It's a remake of *Biplane Duel* (
 
 **[Play it online](https://jaybizzle.github.io/bip/)**, or open `index.html` in a browser. Press **Space** to start. There's no build step and nothing to install.
 
+## Online play
+
+Click **Play online** under the game, then send the link it gives you to your opponent. When they open it, either of you presses **Space** to start. Online, you each fly your own plane with either set of keys.
+
+The two browsers connect directly using [PeerJS](https://peerjs.com/). Its free public server only introduces them. The host's browser runs the game, and the other browser sends its controls and draws what the host sends back. The host's tab needs to stay in the foreground, because browsers pause background tabs.
+
 ## Controls
 
 | | Throttle (on/off) | Loop back | Loop forward | Fire |
