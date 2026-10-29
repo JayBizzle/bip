@@ -129,11 +129,13 @@ function toggleThrottle(p) {
 }
 
 // Online, each player flies their own plane with either set of keys, and the host
-// reads the guest's plane from the controls the guest last sent.
+// reads the guest's plane from the controls the guest last sent. The planes face opposite
+// ways, so the other player's loop keys are swapped to keep left meaning left.
+const MIRRORED = { pull: 'push', push: 'pull', fire: 'fire' };
 function held(p, action) {
   if (net.mode === 'local') return keys.has(p.keys[action]);
   if (p !== players[net.me]) return !!net.remote[action];
-  return players.some(q => keys.has(q.keys[action]));
+  return keys.has(p.keys[action]) || keys.has(other(p).keys[MIRRORED[action]]);
 }
 
 // ---------- Audio ----------
