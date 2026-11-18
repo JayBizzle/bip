@@ -19,6 +19,17 @@ A two-player biplane dogfight for the browser. It's a remake of *Biplane Duel* (
 
 Rolling banks the plane into a turn. The **Pitch** button under the game swaps climb and dive if you prefer flight-sim controls. Brackets show the other plane when it's in view, and an arrow points to it when it isn't. Stalls, gun overheating, crashing into the ground or hut, and runway protection work as in the original. Fly too far out and the plane turns back on its own. The balloon, seagull and parachutes haven't been added yet.
 
+## Bip Iso
+
+**[Play the isometric version](https://jaybizzle.github.io/bip/iso/)**, or open `iso/index.html`. It's a third-person variant seen from above at an isometric angle. One shared camera pans and zooms to keep both planes on screen, so there's no split screen, and online you both see the same view.
+
+| | Climb / dive | Turn | Engine (on/off) | Fire |
+|---|---|---|---|---|
+| **Player 1** (red) | W / S | A / D | Q | Space |
+| **Player 2** (blue) | ↑ / ↓ | ← / → | Right Shift | Enter |
+
+Turns are relative to the plane, and the nose levels out when you let go of climb or dive. Each plane casts a shadow and has a line down to the ground showing its height. Height is hard to judge from above, so when the other plane is roughly ahead of you, your guns aim up or down at where it's heading. The rest of the rules match Bip 3D.
+
 ## Online play
 
 Click **Play online** under the game, then send the link it gives you to your opponent. When they open it, either of you presses **Space** to start. Online, you each fly your own plane with either set of keys.

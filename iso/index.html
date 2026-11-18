@@ -1,0 +1,1044 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bip Iso</title>
+<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+<style>
+  body {
+    margin: 0;
+    padding: 16px;
+    background: #111;
+    color: #ccc;
+    font-family: 'Press Start 2P', monospace;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 16px;
+  }
+  .screen {
+    /* Fill as much of the window as the 16:10 aspect ratio allows, leaving room for the key legend. */
+    position: relative;
+    width: min(calc(100vw - 40px), calc((100vh - 260px) * 1.6));
+    aspect-ratio: 16 / 10;
+    border: 4px solid #444;
+  }
+  .screen canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+  /* The scene is rendered small and scaled up with hard pixels, like an Amiga. */
+  #gl { image-rendering: pixelated; }
+  .keys { display: flex; gap: 48px; font-size: 10px; line-height: 2; }
+  .p1 { color: #f55; }
+  .p2 { color: #6af; }
+  .online { display: flex; align-items: center; gap: 12px; font-size: 10px; line-height: 2; text-align: center; flex-wrap: wrap; justify-content: center; }
+  .online button, .online input { font: inherit; background: #222; color: #ff0; border: 2px solid #444; padding: 6px 10px; }
+  .online button { cursor: pointer; }
+  .online button:hover { border-color: #ff0; }
+  .online input { color: #ccc; width: 34ch; }
+  .links { display: flex; gap: 24px; }
+  a { color: #888; font-size: 10px; }
+  a:hover { color: #ff0; }
+  [hidden] { display: none !important; }
+</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.4/peerjs.min.js"></script>
+</head>
+<body>
+<div class="screen">
+  <canvas id="gl" width="640" height="400"></canvas>
+  <canvas id="hud" width="1920" height="1200"></canvas>
+</div>
+<div class="keys" id="keys"></div>
+<div class="online">
+  <button id="host-btn">PLAY ONLINE</button>
+  <button id="invert-btn"></button>
+  <span id="status"></span>
+  <input id="link" readonly hidden>
+  <button id="copy-btn" hidden>COPY</button>
+</div>
+<div class="links"><a href="../">CLASSIC BIP</a><a href="../3d/">BIP 3D</a></div>
+<script type="module">
+import * as THREE from 'https://cdnjs.cloudflare.com/ajax/libs/three.js/0.160.0/three.module.min.js';
+
+// The scene renders at 640x400 and is scaled up; the HUD is drawn on top in 960x600 units.
+const RW = 640, RH = 400, WIN_SCORE = 10;
+// Same feel as the 2D game: gravity outweighs the engine, so any sustained climb bleeds speed.
+const MAX_SPEED = 95, ACCEL = 30, GROUND_ACCEL = 45, DRAG = 14, GROUND_FRICTION = 30;
+const TAKEOFF = 55, STALL = 28, GRAVITY = 60;
+// Radians per second. With no climb or dive held, the nose levels out on its own.
+const TURN_RATE = 1.9, PITCH_RATE = 1.4, MAX_PITCH = 1.1, LEVEL_RATE = 0.7, TAXI_TURN = 0.8;
+const BULLET_SPEED = 200, BULLET_LIFE = 1.4, FIRE_DELAY = 0.15, HIT_RADIUS = 7;
+// Height is hard to judge from above, so the guns aim up or down at a plane roughly ahead,
+// and nudge a little sideways toward it.
+const AIM_RANGE = 320, AIM_CONE = 0.35, AIM_PITCH = 0.6, AIM_YAW = 0.08;
+const HEAT_PER_SHOT = 0.1, COOL_RATE = 0.3, JAMMED_COOL_RATE = 0.5;
+// Fly past ARENA and the plane is steered back. Above CEILING the engine gives no thrust.
+const ARENA = 450, BOUNDARY_TURN = 1.5, CEILING = 250;
+const RESPAWN = 3, PLANE_COLLIDE = 9, GEAR = 1.85 * 1.4, PLANE_SCALE = 1.4;
+// The camera looks down from the south-east at the classic isometric angle.
+const ISO_DIR = new THREE.Vector3(1, Math.SQRT2 * 0.6, 1).normalize();
+
+const V3 = THREE.Vector3;
+const tv1 = new V3(), tv2 = new V3();
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const normAngle = a => Math.atan2(Math.sin(a), Math.cos(a));
+const approach = (v, target, step) => (v < target ? Math.min(target, v + step) : Math.max(target, v - step));
+
+// Scenery comes from a fixed seed so both players see the same world online.
+function mulberry32(a) {
+  return () => {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const rand = mulberry32(1987);
+
+// ---------- Online state (used by the effects below) ----------
+const net = { mode: 'local', me: 0, code: null, peer: null, conn: null, remote: {}, sentInput: '', events: [], lastSend: 0, lastHeard: 0 };
+function record(name, args) {
+  if (net.mode === 'host') net.events.push([name, ...args]);
+}
+
+// ---------- Players ----------
+const players = [
+  { name: 'RED', hud: '#f55', body: 0xdd3333, wing: 0x992222,
+    start: new V3(-330, GEAR, -25), startYaw: -Math.PI / 2,
+    keys: { climb: 'KeyW', dive: 'KeyS', left: 'KeyA', right: 'KeyD', fire: 'Space', throttle: 'KeyQ' } },
+  { name: 'BLUE', hud: '#6af', body: 0x3388ff, wing: 0x113399,
+    start: new V3(330, GEAR, 25), startYaw: Math.PI / 2,
+    keys: { climb: 'ArrowUp', dive: 'ArrowDown', left: 'ArrowLeft', right: 'ArrowRight', fire: 'Enter', throttle: 'ShiftRight' } },
+];
+for (const p of players) {
+  p.pos = new V3(); p.fwd = new V3(); p.deathPos = new V3();
+  p.score = 0;
+}
+const other = p => (players[0] === p ? players[1] : players[0]);
+const game = { state: 'title', winner: null, readyAt: 0 };
+let bullets = [];
+let particles = [];
+
+// ---------- Input ----------
+const LABELS = { KeyW: 'W', KeyS: 'S', KeyA: 'A', KeyD: 'D', KeyQ: 'Q', Space: 'SPACE', ArrowUp: 'UP', ArrowDown: 'DOWN',
+  ArrowLeft: 'LEFT', ArrowRight: 'RIGHT', Enter: 'ENTER', ShiftRight: 'R.SHIFT' };
+const GAME_KEYS = new Set(players.flatMap(p => Object.values(p.keys)));
+const keys = new Set();
+let invert = false;
+try { invert = localStorage.getItem('bipiso-invert') === '1'; } catch {}
+
+// Arcade pitch: up climbs. Flight-sim pitch: up pushes the nose down.
+const pitchKey = action => (invert && (action === 'climb' || action === 'dive') ? (action === 'climb' ? 'dive' : 'climb') : action);
+
+addEventListener('keydown', e => {
+  if (GAME_KEYS.has(e.code)) e.preventDefault();
+  keys.add(e.code);
+  initAudio();
+  if (e.repeat) return;
+  const owner = players.find(p => e.code === p.keys.throttle);
+  // Online, either throttle key works your own plane.
+  if (owner) toggleThrottle(net.mode === 'local' ? owner : players[net.me]);
+  if ((e.code === 'Space' || e.code === 'Enter') && game.state !== 'play' && performance.now() > game.readyAt) {
+    if (net.mode === 'guest') net.conn.send({ t: 'start' });
+    else startGame();
+  }
+});
+addEventListener('keyup', e => keys.delete(e.code));
+addEventListener('blur', () => keys.clear());
+
+function toggleThrottle(p) {
+  if (net.mode === 'guest') net.conn.send({ t: 'throttle' });
+  else if (game.state === 'play' && p.state === 'alive') p.throttleOn = !p.throttleOn;
+}
+
+// Online, each player flies their own plane with either set of keys, and the host
+// reads the guest's plane from the controls the guest last sent.
+function held(p, action) {
+  if (net.mode !== 'local' && p !== players[net.me]) return !!net.remote[action];
+  action = pitchKey(action);
+  if (net.mode === 'local') return keys.has(p.keys[action]);
+  return keys.has(p.keys[action]) || keys.has(other(p).keys[action]);
+}
+
+function keyLabel(p, action) {
+  action = pitchKey(action);
+  if (net.mode === 'local') return LABELS[p.keys[action]];
+  return `${LABELS[players[0].keys[action]]} OR ${LABELS[players[1].keys[action]]}`;
+}
+
+const keysEl = document.getElementById('keys');
+const invertBtn = document.getElementById('invert-btn');
+function updateLegend() {
+  keysEl.innerHTML = players.map((p, i) => {
+    const k = a => LABELS[p.keys[pitchKey(a)]];
+    return `<div class="p${i + 1}">PLAYER ${i + 1} (${p.name})<br>${k('climb')} climb<br>${k('dive')} dive<br>` +
+      `${k('left')}/${k('right')} turn<br>${k('throttle')} engine on/off<br>${k('fire')} fire</div>`;
+  }).join('');
+  invertBtn.textContent = invert ? 'PITCH: FLIGHT SIM' : 'PITCH: ARCADE';
+}
+invertBtn.addEventListener('click', () => {
+  invertBtn.blur();
+  invert = !invert;
+  try { localStorage.setItem('bipiso-invert', invert ? '1' : '0'); } catch {}
+  updateLegend();
+});
+updateLegend();
+
+// ---------- Audio ----------
+let ac = null;
+const engines = [];
+
+function initAudio() {
+  if (ac) return;
+  ac = new AudioContext();
+  players.forEach((p, i) => {
+    const o = ac.createOscillator();
+    o.type = 'sawtooth';
+    const f = ac.createBiquadFilter();
+    f.type = 'lowpass';
+    f.frequency.value = 400;
+    const g = ac.createGain();
+    g.gain.value = 0;
+    o.connect(f).connect(g).connect(ac.destination);
+    o.start();
+    engines[i] = { o, g };
+  });
+}
+
+function updateEngines() {
+  if (!ac) return;
+  players.forEach((p, i) => {
+    const on = game.state === 'play' && p.state !== 'dead';
+    let gain = on ? (p.throttleOn ? 0.03 : 0.012) : 0;
+    let freq = 45 + p.speed * 1.2 + i * 7;
+    // Near the stall the engine coughs: random dropouts and pitch dips.
+    const coughing = on && p.state === 'alive' && Math.random() < p.stallWarn * 0.5;
+    if (coughing) { gain *= 0.1; freq *= 0.7; }
+    engines[i].g.gain.setTargetAtTime(gain, ac.currentTime, coughing ? 0.01 : 0.05);
+    engines[i].o.frequency.setTargetAtTime(freq, ac.currentTime, 0.05);
+  });
+}
+
+function sfxShot() {
+  record('sfxShot', arguments);
+  if (!ac) return;
+  const t = ac.currentTime;
+  const o = ac.createOscillator();
+  const g = ac.createGain();
+  o.type = 'square';
+  o.frequency.setValueAtTime(900, t);
+  o.frequency.exponentialRampToValueAtTime(150, t + 0.06);
+  g.gain.setValueAtTime(0.05, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + 0.07);
+  o.connect(g).connect(ac.destination);
+  o.start(t);
+  o.stop(t + 0.08);
+}
+
+function sfxBoom(dur = 0.8, vol = 0.3) {
+  record('sfxBoom', arguments);
+  if (!ac) return;
+  const t = ac.currentTime;
+  const b = ac.createBuffer(1, ac.sampleRate * dur, ac.sampleRate);
+  const d = b.getChannelData(0);
+  for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  const s = ac.createBufferSource();
+  s.buffer = b;
+  const f = ac.createBiquadFilter();
+  f.type = 'lowpass';
+  f.frequency.setValueAtTime(900, t);
+  f.frequency.exponentialRampToValueAtTime(80, t + dur);
+  const g = ac.createGain();
+  g.gain.setValueAtTime(vol, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  s.connect(f).connect(g).connect(ac.destination);
+  s.start(t);
+}
+
+function sfxHit() {
+  record('sfxHit', arguments);
+  if (!ac) return;
+  const t = ac.currentTime;
+  const o = ac.createOscillator();
+  const g = ac.createGain();
+  o.type = 'triangle';
+  o.frequency.setValueAtTime(600, t);
+  o.frequency.exponentialRampToValueAtTime(300, t + 0.05);
+  g.gain.setValueAtTime(0.08, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + 0.06);
+  o.connect(g).connect(ac.destination);
+  o.start(t);
+  o.stop(t + 0.07);
+}
+
+// ---------- Scene ----------
+const renderer = new THREE.WebGLRenderer({ canvas: document.getElementById('gl'), antialias: false });
+renderer.setPixelRatio(1);
+renderer.setSize(RW, RH, false);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x2f6a24);
+scene.add(new THREE.HemisphereLight(0xddeeff, 0x557744, 1.2));
+const sun = new THREE.DirectionalLight(0xffffff, 1.8);
+sun.position.set(-200, 500, 300);
+scene.add(sun);
+
+const mats = {};
+const lambert = color => (mats[color] ||= new THREE.MeshLambertMaterial({ color, flatShading: true }));
+function box(w, h, d, color, x, y, z, mat = lambert(color)) {
+  const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
+  m.position.set(x, y, z);
+  return m;
+}
+
+// Patchwork fields with hedges.
+function fieldTexture() {
+  const c = document.createElement('canvas');
+  c.width = c.height = 256;
+  const g = c.getContext('2d');
+  const greens = ['#3a7a2a', '#4a8a30', '#2f6a24', '#5a9036', '#6f9a3a', '#8a9a40', '#3f7f2c'];
+  const pick = () => greens[Math.floor(rand() * greens.length)];
+  for (let y = 0; y < 256; y += 64) {
+    for (let x = 0; x < 256; x += 64) {
+      g.fillStyle = pick();
+      g.fillRect(x, y, 64, 64);
+      if (rand() < 0.6) {
+        const split = 16 + Math.floor(rand() * 32);
+        g.fillStyle = pick();
+        if (rand() < 0.5) g.fillRect(x, y + split, 64, 64 - split);
+        else g.fillRect(x + split, y, 64 - split, 64);
+      }
+      // Ploughed furrows on some fields.
+      if (rand() < 0.25) {
+        g.fillStyle = 'rgba(0,0,0,0.12)';
+        for (let i = 2; i < 64; i += 5) g.fillRect(x, y + i, 64, 1);
+      }
+      g.fillStyle = '#2a5a1e';
+      g.fillRect(x, y, 64, 2);
+      g.fillRect(x, y, 2, 64);
+    }
+  }
+  const tex = new THREE.CanvasTexture(c);
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.repeat.set(24, 24);
+  tex.magFilter = THREE.NearestFilter;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(6000, 6000), new THREE.MeshLambertMaterial({ map: fieldTexture() }));
+ground.rotation.x = -Math.PI / 2;
+scene.add(ground);
+
+// A faint line on the ground marks the edge of the arena.
+const ring = new THREE.Mesh(new THREE.RingGeometry(ARENA - 1.5, ARENA + 1.5, 128),
+  new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.25, depthWrite: false }));
+ring.rotation.x = -Math.PI / 2;
+ring.position.y = 0.1;
+scene.add(ring);
+
+// Runways, one per player, offset so nobody meets head-on before take-off.
+for (const p of players) {
+  const cx = Math.sign(p.start.x) * 220;
+  scene.add(box(240, 0.2, 20, 0x6a6a6a, cx, 0.1, p.start.z));
+  for (let x = -108; x <= 108; x += 24) scene.add(box(10, 0.25, 1.4, 0xeeeeee, cx + x, 0.12, p.start.z));
+}
+
+// The hut sits between the runways, as in the original.
+const HUT = { hx: 9, hz: 8, top: 17 };
+{
+  scene.add(box(14, 9, 12, 0xa0643a, 0, 4.5, 0));
+  const roof = new THREE.Mesh(new THREE.CylinderGeometry(8, 8, 13, 3), lambert(0xcc3333));
+  roof.rotation.x = -Math.PI / 2;
+  roof.scale.set(1, 1, 0.6);
+  roof.position.set(0, 11.4, 0);
+  scene.add(roof);
+  scene.add(box(3, 5.5, 0.3, 0x3a2210, 0, 2.75, 6.05));
+  for (const x of [-4.5, 4.5]) scene.add(box(2.4, 2.4, 0.3, 0xffffdd, x, 5.5, 6.05));
+}
+const inHut = pos => Math.abs(pos.x) < HUT.hx && Math.abs(pos.z) < HUT.hz && pos.y < HUT.top;
+
+// Trees, kept off the airfield.
+{
+  const trees = new THREE.InstancedMesh(new THREE.ConeGeometry(3, 10, 5), lambert(0x2a5a1e), 500);
+  const m = new THREE.Matrix4(), q = new THREE.Quaternion(), s = new V3(), pos = new V3();
+  for (let i = 0; i < 500; i++) {
+    let x, z;
+    do { x = (rand() - 0.5) * 2400; z = (rand() - 0.5) * 2400; } while (Math.abs(z) < 70 && Math.abs(x) < 400);
+    const k = 0.7 + rand() * 0.8;
+    s.set(k, k, k);
+    m.compose(pos.set(x, 5 * k, z), q, s);
+    trees.setMatrixAt(i, m);
+  }
+  scene.add(trees);
+}
+
+// See-through clouds above the ceiling, so they never hide the planes for long.
+const cloudMat = new THREE.MeshLambertMaterial({ color: 0xffffff, emissive: 0x667788, flatShading: true, transparent: true, opacity: 0.4, depthWrite: false });
+const cloudGeo = new THREE.IcosahedronGeometry(1, 0);
+for (let i = 0; i < 14; i++) {
+  const cloud = new THREE.Group();
+  const a = rand() * Math.PI * 2, r = 80 + rand() * 700;
+  cloud.position.set(Math.cos(a) * r, CEILING + 60 + rand() * 60, Math.sin(a) * r);
+  for (let j = 0, n = 3 + Math.floor(rand() * 3); j < n; j++) {
+    const puff = new THREE.Mesh(cloudGeo, cloudMat);
+    const k = 12 + rand() * 14;
+    puff.scale.set(k * 1.4, k * 0.8, k);
+    puff.position.set((j - n / 2) * 16 + rand() * 6, rand() * 6, rand() * 14);
+    puff.rotation.set(rand() * 3, rand() * 3, rand() * 3);
+    cloud.add(puff);
+  }
+  scene.add(cloud);
+}
+
+// Biplane, built nose-first along -Z, plus a shadow and a line down to it showing its height.
+const shadowMat = new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.3, depthWrite: false });
+function makePlane(p) {
+  const { body, wing } = p;
+  const g = new THREE.Group();
+  g.add(box(1.3, 1.3, 6.4, body, 0, 0, 0.4));
+  g.add(box(1.5, 1.5, 0.9, 0x999999, 0, 0, -3.2));
+  g.add(box(10, 0.15, 1.6, wing, 0, -0.55, -1.2));
+  g.add(box(10.4, 0.15, 1.6, wing, 0, 2.2, -1.5));
+  for (const x of [-3.8, 3.8]) g.add(box(0.12, 2.75, 0.12, 0x222222, x, 0.83, -1.35));
+  g.add(box(3.6, 0.12, 1.1, wing, 0, 0.1, 3.3));
+  g.add(box(0.12, 1.5, 1.1, body, 0, 0.9, 3.4));
+  for (const x of [-0.9, 0.9]) {
+    g.add(box(0.1, 1, 0.1, 0x222222, x, -1.0, -1.6));
+    g.add(box(0.3, 0.7, 0.7, 0x111111, x, -1.5, -1.6));
+  }
+  g.add(box(0.5, 0.5, 0.5, 0xffcc99, 0, 0.85, 0.8));
+  const blade = box(0.3, 4, 0.08, 0x8a6a40, 0, 0, -3.75);
+  const disc = new THREE.Mesh(new THREE.CircleGeometry(2.1, 12),
+    new THREE.MeshBasicMaterial({ color: 0xcccccc, transparent: true, opacity: 0.25, side: THREE.DoubleSide, depthWrite: false }));
+  disc.position.z = -3.76;
+  g.add(blade, disc);
+  g.scale.setScalar(PLANE_SCALE);
+  g.rotation.order = 'YXZ';
+
+  const shadow = new THREE.Group();
+  shadow.add(box(1.3, 0.01, 6.4, 0, 0, 0, 0.4, shadowMat), box(10.4, 0.01, 1.6, 0, 0, 0, -1.4, shadowMat), box(3.6, 0.01, 1.1, 0, 0, 0, 3.3, shadowMat));
+  shadow.scale.setScalar(PLANE_SCALE);
+  shadow.position.y = 0.2;
+
+  const drop = box(0.35, 1, 0.35, 0, 0, 0, 0, new THREE.MeshBasicMaterial({ color: p.hud, transparent: true, opacity: 0.45, depthWrite: false }));
+  scene.add(g, shadow, drop);
+  Object.assign(p, { g, blade, disc, shadow, drop });
+}
+players.forEach(makePlane);
+
+// Particles and bullets are instanced cubes: cheap, and they look right at this resolution.
+const MAX_PARTICLES = 3000, MAX_BULLETS = 200;
+const partMesh = new THREE.InstancedMesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshBasicMaterial(), MAX_PARTICLES);
+const bulletMesh = new THREE.InstancedMesh(new THREE.BoxGeometry(0.9, 0.9, 5), new THREE.MeshBasicMaterial({ color: 0xffff66 }), MAX_BULLETS);
+partMesh.frustumCulled = bulletMesh.frustumCulled = false;
+for (let i = 0; i < MAX_PARTICLES; i++) partMesh.setColorAt(i, new THREE.Color());
+partMesh.count = bulletMesh.count = 0;
+scene.add(partMesh, bulletMesh);
+const colorCache = {};
+const toColor = c => (colorCache[c] ||= new THREE.Color(c));
+
+// ---------- Game ----------
+function resetPlane(p) {
+  p.pos.copy(p.start);
+  p.yaw = p.startYaw;
+  p.pitch = 0;
+  p.bank = 0;
+  p.speed = 0;
+  p.fallVy = 0;
+  p.onGround = true;
+  p.state = 'alive';
+  p.cooldown = 0;
+  p.respawn = 0;
+  p.heat = 0;
+  p.jammed = false;
+  p.throttleOn = false;
+  p.stallWarn = 0;
+  p.stalled = false;
+  p.dyingT = 0;
+  updateFwd(p);
+}
+
+function startGame() {
+  players.forEach(p => { p.score = 0; resetPlane(p); });
+  bullets = [];
+  particles = [];
+  game.state = 'play';
+  game.winner = null;
+}
+
+const dirFrom = (yaw, pitch, out) => out.set(-Math.sin(yaw) * Math.cos(pitch), Math.sin(pitch), -Math.cos(yaw) * Math.cos(pitch));
+const updateFwd = p => dirFrom(p.yaw, p.pitch, p.fwd);
+players.forEach(resetPlane);
+
+function burst(x, y, z, n, colors, speed, life, size = 1.5) {
+  record('burst', arguments);
+  for (let i = 0; i < n && particles.length < MAX_PARTICLES; i++) {
+    const u = Math.random() * 2 - 1, th = Math.random() * Math.PI * 2, r = Math.sqrt(1 - u * u);
+    const v = Math.random() * speed;
+    const l = life * (0.5 + Math.random() * 0.5);
+    particles.push({
+      x, y, z, vx: r * Math.cos(th) * v, vy: u * v + speed * 0.3, vz: r * Math.sin(th) * v,
+      life: l, max: l, color: colors[i % colors.length], grav: 30, size, grow: 0,
+    });
+  }
+}
+
+function puff(pos, color, life, size, grow) {
+  if (particles.length >= MAX_PARTICLES) return;
+  particles.push({
+    x: pos.x + Math.random() - 0.5, y: pos.y + Math.random() - 0.5, z: pos.z + Math.random() - 0.5,
+    vx: 0, vy: 3, vz: 0, life, max: life, color, grav: 0, size, grow,
+  });
+}
+
+function score(p) {
+  p.score++;
+  if (p.score >= WIN_SCORE) {
+    game.state = 'over';
+    game.winner = p;
+    // Give a held fire key time to let go before Space/Enter can restart.
+    game.readyAt = performance.now() + 1500;
+  }
+}
+
+function explode(p, awardOpponent) {
+  burst(p.pos.x, p.pos.y, p.pos.z, 60, ['#ff0', '#f80', '#f30', '#fff', '#555'], 40, 1.4, 2.2);
+  sfxBoom();
+  if (awardOpponent) score(other(p));
+  p.state = 'dead';
+  p.respawn = RESPAWN;
+  p.deathPos.copy(p.pos);
+}
+
+function shotDown(p, shooter) {
+  score(shooter);
+  p.state = 'dying';
+  p.dyingT = 0;
+  burst(p.pos.x, p.pos.y, p.pos.z, 14, ['#ff0', '#f80'], 25, 0.6);
+  sfxHit();
+  sfxBoom(0.3, 0.2);
+}
+
+function fire(p) {
+  p.cooldown = FIRE_DELAY;
+  p.heat += HEAT_PER_SHOT;
+  if (p.heat >= 1) { p.heat = 1; p.jammed = true; }
+  let yaw = p.yaw, pitch = p.pitch;
+  const o = other(p);
+  if (o.state === 'alive' && !o.onGround) {
+    // Lead the target: aim where it will be when the bullets get there.
+    const v = BULLET_SPEED + p.speed, aim = tv2.copy(o.pos);
+    for (let i = 0; i < 3; i++) {
+      const t = aim.distanceTo(p.pos) / v;
+      aim.copy(o.pos).addScaledVector(o.fwd, o.speed * t);
+      aim.y -= o.fallVy * t;
+    }
+    const dx = aim.x - p.pos.x, dz = aim.z - p.pos.z, h = Math.hypot(dx, dz);
+    const off = normAngle(Math.atan2(-dx, -dz) - p.yaw);
+    if (h < AIM_RANGE && Math.abs(off) < AIM_CONE) {
+      pitch = clamp(Math.atan2(aim.y - p.pos.y, h), p.pitch - AIM_PITCH, p.pitch + AIM_PITCH);
+      yaw += clamp(off, -AIM_YAW, AIM_YAW);
+    }
+  }
+  const dir = dirFrom(yaw, pitch, tv1);
+  const v = BULLET_SPEED + p.speed;
+  const ox = p.pos.x + p.fwd.x * 5, oy = p.pos.y + p.fwd.y * 5, oz = p.pos.z + p.fwd.z * 5;
+  bullets.push({ x: ox, y: oy, z: oz, vx: dir.x * v, vy: dir.y * v, vz: dir.z * v, life: BULLET_LIFE, owner: p });
+  sfxShot();
+}
+
+function updatePlane(p, dt) {
+  if (p.state === 'dead') {
+    if ((p.respawn -= dt) <= 0) resetPlane(p);
+    return;
+  }
+  p.cooldown -= dt;
+  p.heat = Math.max(0, p.heat - (p.jammed ? JAMMED_COOL_RATE : COOL_RATE) * dt);
+  if (p.jammed && p.heat === 0) p.jammed = false;
+
+  if (p.state === 'dying') {
+    // Spiral down trailing smoke.
+    p.dyingT += dt;
+    p.pitch = approach(p.pitch, -MAX_PITCH, 0.9 * dt);
+    p.bank += 4 * dt;
+    p.yaw += 1.2 * dt;
+    p.speed += (50 - p.speed) * dt;
+    p.fallVy += GRAVITY * 0.3 * dt;
+  } else {
+    const climb = (held(p, 'climb') ? 1 : 0) - (held(p, 'dive') ? 1 : 0);
+    const turn = (held(p, 'right') ? 1 : 0) - (held(p, 'left') ? 1 : 0);
+    // Guns only work once airborne.
+    if (held(p, 'fire') && p.cooldown <= 0 && !p.jammed && !p.onGround) fire(p);
+
+    if (p.onGround) {
+      p.speed = clamp(p.speed + (p.throttleOn ? GROUND_ACCEL : -GROUND_FRICTION) * dt, 0, MAX_SPEED);
+      p.yaw -= turn * TAXI_TURN * dt;
+      p.stallWarn = 0;
+      // Can't lift off below take-off speed.
+      if (climb > 0 && p.speed >= TAKEOFF) {
+        p.onGround = false;
+        p.pitch = 0.1;
+      }
+    } else {
+      const ctrl = p.stalled ? 0.35 : 1;
+      p.yaw -= turn * TURN_RATE * ctrl * dt;
+      // Lean into turns.
+      p.bank += (-turn * 0.7 - p.bank) * Math.min(1, 6 * dt);
+      if (climb) p.pitch = clamp(p.pitch + climb * PITCH_RATE * ctrl * dt, -MAX_PITCH, MAX_PITCH);
+      else if (!p.stalled) p.pitch = approach(p.pitch, 0, LEVEL_RATE * dt);
+
+      const thrust = p.throttleOn && p.pos.y < CEILING;
+      p.speed = clamp(p.speed + (thrust ? ACCEL : -DRAG) * dt - GRAVITY * Math.sin(p.pitch) * dt, 0, MAX_SPEED);
+      // 0 at a safe speed, rising to 1 at the stall: drives the engine cough and wing wobble.
+      p.stallWarn = clamp((STALL * 1.5 - p.speed) / (STALL * 0.5), 0, 1);
+      if (p.speed < STALL) p.stalled = true;
+      else if (p.stalled && p.speed > STALL * 1.4) p.stalled = false;
+      if (p.stalled) {
+        p.fallVy += GRAVITY * dt;
+        p.pitch = approach(p.pitch, -MAX_PITCH, 1.6 * dt);
+      } else {
+        p.fallVy = Math.max(0, p.fallVy - GRAVITY * 2 * dt);
+      }
+
+      // Past the edge of the arena, the plane is turned back toward the middle.
+      const hx = p.pos.x, hz = p.pos.z;
+      if (Math.hypot(hx, hz) > ARENA && p.fwd.x * hx + p.fwd.z * hz > 0) {
+        const off = normAngle(Math.atan2(hx, hz) - p.yaw);
+        p.yaw += Math.sign(off) * BOUNDARY_TURN * dt;
+      }
+    }
+  }
+
+  updateFwd(p);
+  p.pos.addScaledVector(p.fwd, p.speed * dt);
+  if (p.onGround) p.pos.y = GEAR;
+  else p.pos.y -= p.fallVy * dt;
+
+  if ((!p.onGround && p.pos.y < GEAR * 0.5) || inHut(p.pos) || p.dyingT > 12) explode(p, p.state === 'alive');
+}
+
+// Distance from point c to the segment a-b, so fast bullets can't skip through a plane.
+function segDist(ax, ay, az, bx, by, bz, c) {
+  const dx = bx - ax, dy = by - ay, dz = bz - az;
+  const l2 = dx * dx + dy * dy + dz * dz;
+  const t = l2 ? clamp(((c.x - ax) * dx + (c.y - ay) * dy + (c.z - az) * dz) / l2, 0, 1) : 0;
+  return Math.hypot(ax + dx * t - c.x, ay + dy * t - c.y, az + dz * t - c.z);
+}
+
+function updateBullets(dt) {
+  for (const bl of bullets) {
+    const ox = bl.x, oy = bl.y, oz = bl.z;
+    bl.x += bl.vx * dt;
+    bl.y += bl.vy * dt;
+    bl.z += bl.vz * dt;
+    bl.life -= dt;
+    if (bl.y <= 0) {
+      bl.life = 0;
+      burst(bl.x, 0.3, bl.z, 3, ['#6b4a2a', '#3a7a2a'], 8, 0.4, 1);
+      continue;
+    }
+    if (inHut(bl)) {
+      bl.life = 0;
+      burst(bl.x, bl.y, bl.z, 3, ['#a0643a', '#fff'], 8, 0.3, 1);
+      continue;
+    }
+    if (bl.life <= 0) continue;
+    const target = other(bl.owner);
+    // Planes still on the runway are protected, so nobody can be spawn-camped.
+    if (game.state === 'play' && target.state === 'alive' && !target.onGround
+        && segDist(ox, oy, oz, bl.x, bl.y, bl.z, target.pos) < HIT_RADIUS) {
+      bl.life = 0;
+      shotDown(target, bl.owner);
+    }
+  }
+  bullets = bullets.filter(bl => bl.life > 0);
+}
+
+// Smoke trails are only cosmetic, so the guest spawns its own from the state the host sends.
+function spawnTrails() {
+  if (game.state !== 'play') return;
+  for (const p of players) {
+    const tail = tv2.copy(p.pos).addScaledVector(p.fwd, -6);
+    if (p.state === 'dying' && Math.random() < 0.8) puff(tail, Math.random() < 0.5 ? '#444' : '#777', 1.6, 2.5, 3);
+    else if (p.state === 'alive' && !p.onGround && p.stallWarn > 0.6 && Math.random() < 0.3) puff(tail, '#ccc', 0.8, 1.6, 2);
+  }
+}
+
+function updateParticles(dt) {
+  for (const pt of particles) {
+    pt.vy -= pt.grav * dt;
+    pt.x += pt.vx * dt;
+    pt.y += pt.vy * dt;
+    pt.z += pt.vz * dt;
+    pt.life -= dt;
+    if (pt.y < 0.3) { pt.y = 0.3; pt.vy *= -0.3; pt.vx *= 0.5; pt.vz *= 0.5; }
+  }
+  particles = particles.filter(pt => pt.life > 0);
+}
+
+function update(dt) {
+  if (game.state === 'play') {
+    players.forEach(p => updatePlane(p, dt));
+    const [a, b] = players;
+    if (a.state === 'alive' && b.state === 'alive' && a.pos.distanceTo(b.pos) < PLANE_COLLIDE) {
+      // Mid-air collisions destroy both planes and score nothing.
+      explode(a, false);
+      explode(b, false);
+    }
+  }
+  updateBullets(dt);
+  spawnTrails();
+  updateParticles(dt);
+  updateEngines();
+}
+
+// The guest doesn't simulate the game, only the effects around the host's state.
+function updateGuest(dt) {
+  players.forEach(updateFwd);
+  spawnTrails();
+  updateParticles(dt);
+  updateEngines();
+  sendInput(performance.now());
+}
+
+// ---------- Camera ----------
+// One shared camera that pans and zooms to keep both planes in view.
+const ASPECT = RW / RH, MIN_HALF = 55, MAX_HALF = 420;
+const cam = new THREE.OrthographicCamera(-1, 1, 1, -1, 1, 4000);
+const camRight = new V3(1, 0, -1).normalize();
+const camUp = new V3().crossVectors(camRight, ISO_DIR.clone().negate()).normalize();
+const view = { target: new V3(), half: 200, ready: false };
+
+function updateCamera(dt) {
+  const [a, b] = players.map(p => (p.state === 'dead' ? p.deathPos : p.pos));
+  const mid = tv1.addVectors(a, b).multiplyScalar(0.5);
+  const d = tv2.subVectors(a, b);
+  const half = clamp(Math.max(Math.abs(d.dot(camUp)) / 2 + 60, (Math.abs(d.dot(camRight)) / 2 + 110) / ASPECT), MIN_HALF, MAX_HALF);
+  const k = view.ready ? 1 - Math.exp(-2.5 * dt) : 1;
+  view.ready = true;
+  view.target.lerp(mid, k);
+  view.half += (half - view.half) * k;
+  cam.position.copy(view.target).addScaledVector(ISO_DIR, 1500);
+  cam.lookAt(view.target);
+  cam.top = view.half;
+  cam.bottom = -view.half;
+  cam.left = -view.half * ASPECT;
+  cam.right = view.half * ASPECT;
+  cam.updateProjectionMatrix();
+  cam.updateMatrixWorld();
+}
+
+// ---------- Render ----------
+const hud = document.getElementById('hud').getContext('2d');
+hud.setTransform(2, 0, 0, 2, 0, 0);
+const dummy = new THREE.Object3D();
+const BULLET_AXIS = new V3(0, 0, 1);
+
+function syncMeshes(dt) {
+  const t = performance.now() / 1000;
+  for (const p of players) {
+    const alive = p.state !== 'dead';
+    p.g.visible = p.shadow.visible = alive;
+    p.g.position.copy(p.pos);
+    // Wings wobble as a stall warning.
+    const wobble = p.state === 'alive' && !p.onGround ? p.stallWarn * Math.sin(t * 25) * 0.15 : 0;
+    p.g.rotation.set(p.pitch, p.yaw, p.bank + wobble);
+    const spin = p.throttleOn ? 60 : p.speed * 0.4;
+    p.blade.rotation.z += spin * dt;
+    p.disc.visible = spin > 20;
+    p.blade.visible = spin <= 20;
+    p.shadow.position.x = p.pos.x;
+    p.shadow.position.z = p.pos.z;
+    p.shadow.rotation.y = p.yaw;
+    const alt = p.pos.y - GEAR;
+    p.drop.visible = alive && alt > 3;
+    p.drop.scale.y = Math.max(alt, 0.01);
+    p.drop.position.set(p.pos.x, alt / 2, p.pos.z);
+  }
+  partMesh.count = particles.length;
+  particles.forEach((pt, i) => {
+    const s = pt.size * (1 + (1 - pt.life / pt.max) * pt.grow);
+    dummy.position.set(pt.x, pt.y, pt.z);
+    dummy.quaternion.identity();
+    dummy.scale.set(s, s, s);
+    dummy.updateMatrix();
+    partMesh.setMatrixAt(i, dummy.matrix);
+    partMesh.setColorAt(i, toColor(pt.color));
+  });
+  partMesh.instanceMatrix.needsUpdate = true;
+  partMesh.instanceColor.needsUpdate = true;
+
+  bulletMesh.count = Math.min(bullets.length, MAX_BULLETS);
+  for (let i = 0; i < bulletMesh.count; i++) {
+    const bl = bullets[i];
+    dummy.position.set(bl.x, bl.y, bl.z);
+    dummy.quaternion.setFromUnitVectors(BULLET_AXIS, tv1.set(bl.vx, bl.vy, bl.vz).normalize());
+    dummy.scale.set(1, 1, 1);
+    dummy.updateMatrix();
+    bulletMesh.setMatrixAt(i, dummy.matrix);
+  }
+  bulletMesh.instanceMatrix.needsUpdate = true;
+}
+
+function drawText(text, x, y, size, color, align = 'center') {
+  hud.font = `${size}px 'Press Start 2P', monospace`;
+  hud.textAlign = align;
+  hud.fillStyle = '#000';
+  const o = Math.max(2, size / 7);
+  hud.fillText(text, x + o, y + o);
+  hud.fillStyle = color;
+  hud.fillText(text, x, y);
+}
+
+function drawHeat(p, x) {
+  const y = 58, w = 120, h = 8;
+  hud.fillStyle = '#000';
+  hud.fillRect(x, y, w, h);
+  const blink = Math.floor(performance.now() / 150) % 2;
+  hud.fillStyle = p.jammed ? (blink ? '#f22' : '#800') : p.heat > 0.7 ? '#f80' : '#fc4';
+  hud.fillRect(x + 1, y + 1, (w - 2) * p.heat, h - 2);
+  if (p.jammed) drawText('JAMMED', x + w / 2, y + 28, 12, '#f44');
+  if (p.state !== 'dead') drawText(p.throttleOn ? 'ENGINE ON' : 'ENGINE OFF', x + w / 2, y + 50, 10, p.throttleOn ? '#6f6' : '#888');
+}
+
+// Labels float above each plane: who it is, plus stall warnings and take-off hints.
+function drawPlaneLabel(p) {
+  if (p.state === 'dead') return;
+  const s = tv1.copy(p.pos).project(cam);
+  const x = (s.x + 1) * 480, y = (1 - s.y) * 300;
+  const blink = Math.floor(performance.now() / 150) % 2;
+  drawText(p.name, x, y - 28, 10, p.hud);
+  let note = null, color = '#ff0';
+  if (p.state === 'dying') { note = 'SHOT DOWN!'; color = '#f44'; }
+  else if (p.onGround) {
+    note = !p.throttleOn ? `${keyLabel(p, 'throttle')}: ENGINE ON` : p.speed < TAKEOFF ? 'GATHERING SPEED...' : `${keyLabel(p, 'climb')}: TAKE OFF`;
+  } else if (p.stallWarn > 0.3) { note = blink ? 'STALL' : null; color = '#f44'; }
+  else if (Math.hypot(p.pos.x, p.pos.z) > ARENA - 40) note = 'TURN BACK';
+  if (note) drawText(note, x, y + 36, 10, color);
+}
+
+function render(dt) {
+  syncMeshes(dt);
+  updateCamera(dt);
+  renderer.render(scene, cam);
+
+  hud.clearRect(0, 0, 960, 600);
+  const [a, b] = players;
+  if (game.state === 'play') players.forEach(drawPlaneLabel);
+  drawText(`${a.name} ${a.score}`, 24, 44, 20, a.hud, 'left');
+  drawText(`${b.score} ${b.name}`, 960 - 24, 44, 20, b.hud, 'right');
+  if (game.state === 'play') {
+    drawHeat(a, 24);
+    drawHeat(b, 960 - 24 - 120);
+  }
+
+  if (game.state !== 'play') {
+    hud.fillStyle = 'rgba(0,0,0,0.35)';
+    hud.fillRect(0, 0, 960, 600);
+  }
+  if (game.state === 'title') {
+    drawText('BIP ISO', 480, 250, 64, '#ff0');
+    drawText(`FIRST TO ${WIN_SCORE}`, 480, 320, 20, '#fff');
+    drawText('PRESS SPACE', 480, 370, 20, '#fff');
+  } else if (game.state === 'over') {
+    drawText(`${game.winner.name} WINS!`, 480, 270, 40, game.winner.hud);
+    if (performance.now() > game.readyAt) drawText('PRESS SPACE', 480, 340, 20, '#fff');
+  }
+  if (game.state !== 'play' && net.mode !== 'local') {
+    const me = players[net.me];
+    drawText(`YOU ARE ${me.name}`, 480, 430, 20, me.hud);
+  }
+}
+
+// ---------- Online ----------
+// The host's browser runs the game and the guest's browser just draws it. The guest sends its
+// controls to the host, and the host sends back the game state plus the effects (bursts and
+// sounds) that happened since the last update, so the guest can replay them.
+const PEER_PREFIX = 'jaybizzle-bipiso-';
+const SEND_INTERVAL = 1000 / 60;
+// The guest resends its controls at least this often so the host knows it's still there,
+// and either side gives up on the other after TIMEOUT of silence.
+const HEARTBEAT = 1000, TIMEOUT = 5000;
+const FX = { burst, sfxShot, sfxBoom, sfxHit };
+
+const hostBtn = document.getElementById('host-btn');
+const copyBtn = document.getElementById('copy-btn');
+const linkEl = document.getElementById('link');
+const statusEl = document.getElementById('status');
+
+function setStatus(text, color = '#ccc') {
+  statusEl.textContent = text;
+  statusEl.style.color = color;
+  linkEl.hidden = copyBtn.hidden = true;
+}
+
+function showLink(code) {
+  setStatus('SEND THIS LINK TO YOUR OPPONENT:');
+  linkEl.value = `${location.origin}${location.pathname}#join=${code}`;
+  linkEl.hidden = copyBtn.hidden = false;
+  copyBtn.textContent = 'COPY';
+}
+
+function hostGame() {
+  hostBtn.hidden = true;
+  setStatus('STARTING...');
+  const code = net.code = Math.random().toString(36).slice(2, 8);
+  const peer = net.peer = new Peer(PEER_PREFIX + code);
+  peer.on('open', () => showLink(code));
+  // Stay reachable if the connection to the matchmaking server blips.
+  peer.on('disconnected', () => { if (!peer.destroyed) peer.reconnect(); });
+  peer.on('connection', conn => {
+    // One opponent at a time.
+    if (net.conn) { conn.on('open', () => conn.close()); return; }
+    conn.on('open', () => connected(conn, 'host'));
+    conn.on('close', () => { if (net.conn === conn) disconnected(); });
+  });
+  peer.on('error', err => {
+    // Someone else already has this code, so pick another.
+    if (err.type === 'unavailable-id') { peer.destroy(); hostGame(); return; }
+    peerError(err);
+  });
+}
+
+function joinGame(code) {
+  hostBtn.hidden = true;
+  setStatus('CONNECTING...');
+  const peer = net.peer = new Peer();
+  peer.on('open', () => {
+    const conn = peer.connect(PEER_PREFIX + code, { serialization: 'json' });
+    conn.on('open', () => connected(conn, 'guest'));
+    conn.on('close', () => { if (net.conn === conn) disconnected(); });
+  });
+  peer.on('error', peerError);
+}
+
+function peerError(err) {
+  if (net.conn) return;
+  setStatus(err.type === 'peer-unavailable' ? 'GAME NOT FOUND. ASK FOR A NEW LINK.' : `CONNECTION FAILED (${err.type})`, '#f44');
+  net.peer?.destroy();
+  net.peer = null;
+  hostBtn.hidden = false;
+}
+
+function connected(conn, mode) {
+  net.conn = conn;
+  net.mode = mode;
+  net.me = mode === 'host' ? 0 : 1;
+  net.remote = {};
+  net.events = [];
+  net.sentInput = '';
+  net.lastHeard = performance.now();
+  conn.on('data', msg => {
+    net.lastHeard = performance.now();
+    (mode === 'host' ? receiveFromGuest : receiveFromHost)(msg);
+  });
+  players.forEach(p => { p.score = 0; resetPlane(p); });
+  bullets = [];
+  particles = [];
+  game.state = 'title';
+  keysEl.hidden = true;
+  const me = players[net.me];
+  setStatus(`CONNECTED! YOU ARE ${me.name}. EITHER SET OF KEYS FLIES YOUR PLANE.`, me.hud);
+}
+
+// The host keeps listening on the same link, so the opponent can rejoin.
+function disconnected() {
+  const conn = net.conn, wasHost = net.mode === 'host';
+  net.conn = null;
+  net.mode = 'local';
+  conn.close();
+  game.state = 'title';
+  keysEl.hidden = false;
+  if (wasHost) {
+    showLink(net.code);
+    statusEl.textContent = 'OPPONENT LEFT. SEND THE LINK AGAIN:';
+  } else {
+    net.peer.destroy();
+    net.peer = null;
+    history.replaceState(null, '', location.pathname);
+    setStatus('LOST CONNECTION TO HOST.', '#f44');
+    hostBtn.hidden = false;
+  }
+}
+
+function receiveFromGuest(msg) {
+  if (msg.t === 'input') net.remote = msg;
+  else if (msg.t === 'throttle') toggleThrottle(players[1]);
+  else if (msg.t === 'start' && game.state !== 'play' && performance.now() > game.readyAt) startGame();
+}
+
+function sendInput(now) {
+  const me = players[1];
+  const input = { t: 'input' };
+  for (const a of ['climb', 'dive', 'left', 'right', 'fire']) input[a] = held(me, a);
+  const json = JSON.stringify(input);
+  if (json === net.sentInput && now - net.lastSend < HEARTBEAT) return;
+  net.sentInput = json;
+  net.lastSend = now;
+  net.conn.send(input);
+}
+
+const r = v => Math.round(v * 100) / 100;
+const r3 = v => Math.round(v * 1000) / 1000;
+
+function sendState(now) {
+  if (now - net.lastSend < SEND_INTERVAL - 2) return;
+  net.lastSend = now;
+  net.conn.send({
+    t: 'state',
+    game: { state: game.state, winner: players.indexOf(game.winner) },
+    players: players.map(p => ({
+      pos: p.pos.toArray().map(r), deathPos: p.deathPos.toArray().map(r),
+      yaw: r3(p.yaw), pitch: r3(p.pitch), bank: r3(p.bank),
+      speed: r(p.speed), state: p.state, onGround: p.onGround, throttleOn: p.throttleOn,
+      stallWarn: r(p.stallWarn), heat: r(p.heat), jammed: p.jammed, score: p.score,
+    })),
+    bullets: bullets.map(bl => [bl.x, bl.y, bl.z, bl.vx, bl.vy, bl.vz].map(r)),
+    events: net.events,
+  });
+  net.events = [];
+}
+
+function receiveFromHost(s) {
+  if (s.t !== 'state') return;
+  if (s.game.state === 'over' && game.state !== 'over') game.readyAt = performance.now() + 1500;
+  game.state = s.game.state;
+  game.winner = players[s.game.winner] || null;
+  s.players.forEach((q, i) => {
+    const p = players[i];
+    p.pos.fromArray(q.pos);
+    p.deathPos.fromArray(q.deathPos);
+    Object.assign(p, { yaw: q.yaw, pitch: q.pitch, bank: q.bank, speed: q.speed, state: q.state, onGround: q.onGround,
+      throttleOn: q.throttleOn, stallWarn: q.stallWarn, heat: q.heat, jammed: q.jammed, score: q.score });
+  });
+  bullets = s.bullets.map(([x, y, z, vx, vy, vz]) => ({ x, y, z, vx, vy, vz }));
+  for (const [name, ...args] of s.events) FX[name](...args);
+}
+
+hostBtn.addEventListener('click', () => { hostBtn.blur(); hostGame(); });
+copyBtn.addEventListener('click', () => {
+  copyBtn.blur();
+  navigator.clipboard.writeText(linkEl.value).then(() => { copyBtn.textContent = 'COPIED'; });
+});
+// Closing the tab tells the other side straight away instead of leaving it to time out.
+addEventListener('pagehide', () => net.conn?.close());
+const joinCode = location.hash.match(/^#join=(\w+)$/);
+if (joinCode) joinGame(joinCode[1]);
+
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min((now - last) / 1000, 1 / 30);
+  last = now;
+  if (net.conn && now - net.lastHeard > TIMEOUT) disconnected();
+  if (net.mode === 'guest') {
+    updateGuest(dt);
+  } else {
+    update(dt);
+    if (net.mode === 'host') sendState(now);
+  }
+  render(dt);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

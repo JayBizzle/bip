@@ -35,6 +35,7 @@
   .online button { cursor: pointer; }
   .online button:hover { border-color: #ff0; }
   .online input { color: #ccc; width: 34ch; }
+  .links { display: flex; gap: 24px; }
   a { color: #888; font-size: 10px; }
   a:hover { color: #ff0; }
   [hidden] { display: none !important; }
@@ -54,7 +55,7 @@
   <input id="link" readonly hidden>
   <button id="copy-btn" hidden>COPY</button>
 </div>
-<a href="../">BACK TO CLASSIC BIP</a>
+<div class="links"><a href="../">CLASSIC BIP</a><a href="../iso/">BIP ISO</a></div>
 <script type="module">
 import * as THREE from 'https://cdnjs.cloudflare.com/ajax/libs/three.js/0.160.0/three.module.min.js';
 
