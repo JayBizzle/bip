@@ -1,0 +1,1147 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bip 3D</title>
+<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+<style>
+  body {
+    margin: 0;
+    padding: 16px;
+    background: #111;
+    color: #ccc;
+    font-family: 'Press Start 2P', monospace;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 16px;
+  }
+  .screen {
+    /* Fill as much of the window as the 16:10 aspect ratio allows, leaving room for the key legend. */
+    position: relative;
+    width: min(calc(100vw - 40px), calc((100vh - 260px) * 1.6));
+    aspect-ratio: 16 / 10;
+    border: 4px solid #444;
+  }
+  .screen canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+  /* The 3D scene is rendered small and scaled up with hard pixels, like an Amiga. */
+  #gl { image-rendering: pixelated; }
+  .keys { display: flex; gap: 48px; font-size: 10px; line-height: 2; }
+  .p1 { color: #f55; }
+  .p2 { color: #6af; }
+  .online { display: flex; align-items: center; gap: 12px; font-size: 10px; line-height: 2; text-align: center; flex-wrap: wrap; justify-content: center; }
+  .online button, .online input { font: inherit; background: #222; color: #ff0; border: 2px solid #444; padding: 6px 10px; }
+  .online button { cursor: pointer; }
+  .online button:hover { border-color: #ff0; }
+  .online input { color: #ccc; width: 34ch; }
+  a { color: #888; font-size: 10px; }
+  a:hover { color: #ff0; }
+  [hidden] { display: none !important; }
+</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.4/peerjs.min.js"></script>
+</head>
+<body>
+<div class="screen">
+  <canvas id="gl" width="480" height="300"></canvas>
+  <canvas id="hud" width="1920" height="1200"></canvas>
+</div>
+<div class="keys" id="keys"></div>
+<div class="online">
+  <button id="host-btn">PLAY ONLINE</button>
+  <button id="invert-btn"></button>
+  <span id="status"></span>
+  <input id="link" readonly hidden>
+  <button id="copy-btn" hidden>COPY</button>
+</div>
+<a href="../">BACK TO CLASSIC BIP</a>
+<script type="module">
+import * as THREE from 'https://cdnjs.cloudflare.com/ajax/libs/three.js/0.160.0/three.module.min.js';
+
+// The scene renders at 480x300 and is scaled up; the HUD is drawn on top in 960x600 units.
+const RW = 480, RH = 300, WIN_SCORE = 10;
+// Same feel as the 2D game: gravity outweighs the engine, so any sustained climb bleeds speed.
+const MAX_SPEED = 95, ACCEL = 30, GROUND_ACCEL = 45, DRAG = 14, GROUND_FRICTION = 30;
+const TAKEOFF = 55, STALL = 28, GRAVITY = 60;
+// Radians per second. Banking also turns the plane, so roll + climb makes a proper turn.
+const PITCH_RATE = 1.5, ROLL_RATE = 2.6, BANK_TURN = 0.9, TAXI_TURN = 0.8;
+const BULLET_SPEED = 220, BULLET_LIFE = 1.6, FIRE_DELAY = 0.15, HIT_RADIUS = 6;
+const HEAT_PER_SHOT = 0.1, COOL_RATE = 0.3, JAMMED_COOL_RATE = 0.5;
+// Fly past ARENA and the plane is steered back. Above CEILING the engine gives no thrust.
+const ARENA = 700, BOUNDARY_TURN = 1.2, CEILING = 400;
+const RESPAWN = 3, PLANE_COLLIDE = 8, GEAR = 1.85;
+// Where the pilot's eyes are, relative to the plane's centre.
+const COCKPIT = new THREE.Vector3(0, 1.35, 0.8);
+
+const V3 = THREE.Vector3;
+const AX = new V3(1, 0, 0), AY = new V3(0, 1, 0), AZ = new V3(0, 0, 1), DOWN = new V3(0, -1, 0);
+const tv1 = new V3(), tv2 = new V3(), tq = new THREE.Quaternion();
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+// Scenery comes from a fixed seed so both players see the same clouds online.
+function mulberry32(a) {
+  return () => {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const rand = mulberry32(1987);
+
+// ---------- Online state (used by the effects below) ----------
+const net = { mode: 'local', me: 0, code: null, peer: null, conn: null, remote: {}, sentInput: '', events: [], lastSend: 0, lastHeard: 0 };
+function record(name, args) {
+  if (net.mode === 'host') net.events.push([name, ...args]);
+}
+
+// ---------- Players ----------
+const players = [
+  { name: 'RED', hud: '#f55', body: 0xdd3333, wing: 0x992222,
+    start: new V3(-370, GEAR, -25), startYaw: -Math.PI / 2,
+    keys: { climb: 'KeyW', dive: 'KeyS', left: 'KeyA', right: 'KeyD', fire: 'Space', throttle: 'KeyQ' } },
+  { name: 'BLUE', hud: '#6af', body: 0x3388ff, wing: 0x113399,
+    start: new V3(370, GEAR, 25), startYaw: Math.PI / 2,
+    keys: { climb: 'ArrowUp', dive: 'ArrowDown', left: 'ArrowLeft', right: 'ArrowRight', fire: 'Enter', throttle: 'ShiftRight' } },
+];
+for (const p of players) {
+  p.pos = new V3(); p.q = new THREE.Quaternion();
+  p.fwd = new V3(); p.up = new V3(); p.right = new V3();
+  p.deathPos = new V3();
+  p.score = 0;
+}
+const other = p => (players[0] === p ? players[1] : players[0]);
+const game = { state: 'title', winner: null, readyAt: 0 };
+let bullets = [];
+let particles = [];
+
+// ---------- Input ----------
+const LABELS = { KeyW: 'W', KeyS: 'S', KeyA: 'A', KeyD: 'D', KeyQ: 'Q', Space: 'SPACE', ArrowUp: 'UP', ArrowDown: 'DOWN',
+  ArrowLeft: 'LEFT', ArrowRight: 'RIGHT', Enter: 'ENTER', ShiftRight: 'R.SHIFT' };
+const GAME_KEYS = new Set(players.flatMap(p => Object.values(p.keys)));
+const keys = new Set();
+let invert = false;
+try { invert = localStorage.getItem('bip3d-invert') === '1'; } catch {}
+
+// Arcade pitch: up climbs. Flight-sim pitch: up pushes the nose down.
+const pitchKey = action => (invert && (action === 'climb' || action === 'dive') ? (action === 'climb' ? 'dive' : 'climb') : action);
+
+addEventListener('keydown', e => {
+  if (GAME_KEYS.has(e.code)) e.preventDefault();
+  keys.add(e.code);
+  initAudio();
+  if (e.repeat) return;
+  const owner = players.find(p => e.code === p.keys.throttle);
+  // Online, either throttle key works your own plane.
+  if (owner) toggleThrottle(net.mode === 'local' ? owner : players[net.me]);
+  if ((e.code === 'Space' || e.code === 'Enter') && game.state !== 'play' && performance.now() > game.readyAt) {
+    if (net.mode === 'guest') net.conn.send({ t: 'start' });
+    else startGame();
+  }
+});
+addEventListener('keyup', e => keys.delete(e.code));
+addEventListener('blur', () => keys.clear());
+
+function toggleThrottle(p) {
+  if (net.mode === 'guest') net.conn.send({ t: 'throttle' });
+  else if (game.state === 'play' && p.state === 'alive') p.throttleOn = !p.throttleOn;
+}
+
+// Online, each player flies their own plane with either set of keys, and the host
+// reads the guest's plane from the controls the guest last sent.
+function held(p, action) {
+  if (net.mode !== 'local' && p !== players[net.me]) return !!net.remote[action];
+  action = pitchKey(action);
+  if (net.mode === 'local') return keys.has(p.keys[action]);
+  return keys.has(p.keys[action]) || keys.has(other(p).keys[action]);
+}
+
+function keyLabel(p, action) {
+  action = pitchKey(action);
+  if (net.mode === 'local') return LABELS[p.keys[action]];
+  return `${LABELS[players[0].keys[action]]} OR ${LABELS[players[1].keys[action]]}`;
+}
+
+const keysEl = document.getElementById('keys');
+const invertBtn = document.getElementById('invert-btn');
+function updateLegend() {
+  keysEl.innerHTML = players.map((p, i) => {
+    const k = a => LABELS[p.keys[pitchKey(a)]];
+    return `<div class="p${i + 1}">PLAYER ${i + 1} (${i ? 'BOTTOM' : 'TOP'})<br>${k('climb')} climb<br>${k('dive')} dive<br>` +
+      `${k('left')}/${k('right')} roll<br>${k('throttle')} engine on/off<br>${k('fire')} fire</div>`;
+  }).join('');
+  invertBtn.textContent = invert ? 'PITCH: FLIGHT SIM' : 'PITCH: ARCADE';
+}
+invertBtn.addEventListener('click', () => {
+  invertBtn.blur();
+  invert = !invert;
+  try { localStorage.setItem('bip3d-invert', invert ? '1' : '0'); } catch {}
+  updateLegend();
+});
+updateLegend();
+
+// ---------- Audio ----------
+let ac = null;
+const engines = [];
+
+function initAudio() {
+  if (ac) return;
+  ac = new AudioContext();
+  players.forEach((p, i) => {
+    const o = ac.createOscillator();
+    o.type = 'sawtooth';
+    const f = ac.createBiquadFilter();
+    f.type = 'lowpass';
+    f.frequency.value = 400;
+    const g = ac.createGain();
+    g.gain.value = 0;
+    o.connect(f).connect(g).connect(ac.destination);
+    o.start();
+    engines[i] = { o, g };
+  });
+}
+
+function updateEngines() {
+  if (!ac) return;
+  players.forEach((p, i) => {
+    const on = game.state === 'play' && p.state !== 'dead';
+    let gain = on ? (p.throttleOn ? 0.03 : 0.012) : 0;
+    let freq = 45 + p.speed * 1.2 + i * 7;
+    // Online you only hear the other plane when it's close.
+    if (net.mode !== 'local' && i !== net.me) gain *= clamp(1 - p.pos.distanceTo(players[net.me].pos) / 500, 0.1, 1);
+    // Near the stall the engine coughs: random dropouts and pitch dips.
+    const coughing = on && p.state === 'alive' && Math.random() < p.stallWarn * 0.5;
+    if (coughing) { gain *= 0.1; freq *= 0.7; }
+    engines[i].g.gain.setTargetAtTime(gain, ac.currentTime, coughing ? 0.01 : 0.05);
+    engines[i].o.frequency.setTargetAtTime(freq, ac.currentTime, 0.05);
+  });
+}
+
+function sfxShot() {
+  record('sfxShot', arguments);
+  if (!ac) return;
+  const t = ac.currentTime;
+  const o = ac.createOscillator();
+  const g = ac.createGain();
+  o.type = 'square';
+  o.frequency.setValueAtTime(900, t);
+  o.frequency.exponentialRampToValueAtTime(150, t + 0.06);
+  g.gain.setValueAtTime(0.05, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + 0.07);
+  o.connect(g).connect(ac.destination);
+  o.start(t);
+  o.stop(t + 0.08);
+}
+
+function sfxBoom(dur = 0.8, vol = 0.3) {
+  record('sfxBoom', arguments);
+  if (!ac) return;
+  const t = ac.currentTime;
+  const b = ac.createBuffer(1, ac.sampleRate * dur, ac.sampleRate);
+  const d = b.getChannelData(0);
+  for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  const s = ac.createBufferSource();
+  s.buffer = b;
+  const f = ac.createBiquadFilter();
+  f.type = 'lowpass';
+  f.frequency.setValueAtTime(900, t);
+  f.frequency.exponentialRampToValueAtTime(80, t + dur);
+  const g = ac.createGain();
+  g.gain.setValueAtTime(vol, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  s.connect(f).connect(g).connect(ac.destination);
+  s.start(t);
+}
+
+function sfxHit() {
+  record('sfxHit', arguments);
+  if (!ac) return;
+  const t = ac.currentTime;
+  const o = ac.createOscillator();
+  const g = ac.createGain();
+  o.type = 'triangle';
+  o.frequency.setValueAtTime(600, t);
+  o.frequency.exponentialRampToValueAtTime(300, t + 0.05);
+  g.gain.setValueAtTime(0.08, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + 0.06);
+  o.connect(g).connect(ac.destination);
+  o.start(t);
+  o.stop(t + 0.07);
+}
+
+// ---------- Scene ----------
+const renderer = new THREE.WebGLRenderer({ canvas: document.getElementById('gl'), antialias: false });
+renderer.setPixelRatio(1);
+renderer.setSize(RW, RH, false);
+renderer.setScissorTest(true);
+
+const HORIZON = 0x96c8e6;
+const scene = new THREE.Scene();
+scene.fog = new THREE.Fog(HORIZON, 400, 2000);
+scene.add(new THREE.HemisphereLight(0xddeeff, 0x557744, 1.2));
+const sun = new THREE.DirectionalLight(0xffffff, 1.8);
+sun.position.set(300, 500, 200);
+scene.add(sun);
+
+const mats = {};
+const lambert = color => (mats[color] ||= new THREE.MeshLambertMaterial({ color, flatShading: true }));
+// Wings glow a little so their shaded undersides don't go black above the pilot's head.
+const lit = color => (mats['lit' + color] ||= new THREE.MeshLambertMaterial({ color, emissive: new THREE.Color(color).multiplyScalar(0.45) }));
+function box(w, h, d, color, x, y, z, mat = lambert(color)) {
+  const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
+  m.position.set(x, y, z);
+  return m;
+}
+
+// Copper-bar style banded sky, matching the 2D game's colours.
+function skyTexture() {
+  const c = document.createElement('canvas');
+  c.width = 1; c.height = 256;
+  const g = c.getContext('2d');
+  const top = [26, 42, 108], bottom = [150, 200, 230];
+  for (let i = 0; i < 256; i++) {
+    const e = Math.max(0, 1 - i / 128);
+    const t = Math.floor(Math.pow(e, 0.6) * 14) / 14;
+    g.fillStyle = `rgb(${bottom.map((b, k) => Math.round(b + (top[k] - b) * t))})`;
+    g.fillRect(0, i, 1, 1);
+  }
+  const tex = new THREE.CanvasTexture(c);
+  tex.magFilter = tex.minFilter = THREE.NearestFilter;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+const sky = new THREE.Mesh(new THREE.SphereGeometry(2400, 24, 32),
+  new THREE.MeshBasicMaterial({ map: skyTexture(), side: THREE.BackSide, fog: false, depthWrite: false }));
+sky.renderOrder = -1;
+scene.add(sky);
+
+// Patchwork fields with hedges.
+function fieldTexture() {
+  const c = document.createElement('canvas');
+  c.width = c.height = 256;
+  const g = c.getContext('2d');
+  const greens = ['#3a7a2a', '#4a8a30', '#2f6a24', '#5a9036', '#6f9a3a', '#8a9a40', '#3f7f2c'];
+  const pick = () => greens[Math.floor(rand() * greens.length)];
+  for (let y = 0; y < 256; y += 64) {
+    for (let x = 0; x < 256; x += 64) {
+      g.fillStyle = pick();
+      g.fillRect(x, y, 64, 64);
+      if (rand() < 0.6) {
+        const split = 16 + Math.floor(rand() * 32);
+        g.fillStyle = pick();
+        if (rand() < 0.5) g.fillRect(x, y + split, 64, 64 - split);
+        else g.fillRect(x + split, y, 64 - split, 64);
+      }
+      // Ploughed furrows on some fields.
+      if (rand() < 0.25) {
+        g.fillStyle = 'rgba(0,0,0,0.12)';
+        for (let i = 2; i < 64; i += 5) g.fillRect(x, y + i, 64, 1);
+      }
+      g.fillStyle = '#2a5a1e';
+      g.fillRect(x, y, 64, 2);
+      g.fillRect(x, y, 2, 64);
+    }
+  }
+  const tex = new THREE.CanvasTexture(c);
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.repeat.set(24, 24);
+  tex.magFilter = THREE.NearestFilter;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(6000, 6000), new THREE.MeshLambertMaterial({ map: fieldTexture() }));
+ground.rotation.x = -Math.PI / 2;
+scene.add(ground);
+
+// Runways, one per player, offset so nobody meets head-on before take-off.
+for (const p of players) {
+  const cx = Math.sign(p.start.x) * 250;
+  scene.add(box(260, 0.2, 18, 0x6a6a6a, cx, 0.1, p.start.z));
+  for (let x = -120; x <= 120; x += 24) scene.add(box(10, 0.25, 1.2, 0xeeeeee, cx + x, 0.12, p.start.z));
+}
+
+// The hut sits between the runways, as in the original.
+const HUT = { hx: 9, hz: 8, top: 17 };
+{
+  scene.add(box(14, 9, 12, 0xa0643a, 0, 4.5, 0));
+  const roof = new THREE.Mesh(new THREE.CylinderGeometry(8, 8, 13, 3), lambert(0xcc3333));
+  roof.rotation.x = -Math.PI / 2;
+  roof.scale.set(1, 1, 0.6);
+  roof.position.set(0, 11.4, 0);
+  scene.add(roof);
+  scene.add(box(3, 5.5, 0.3, 0x3a2210, 0, 2.75, 6.05));
+  for (const x of [-4.5, 4.5]) scene.add(box(2.4, 2.4, 0.3, 0xffffdd, x, 5.5, 6.05));
+}
+const inHut = pos => Math.abs(pos.x) < HUT.hx && Math.abs(pos.z) < HUT.hz && pos.y < HUT.top;
+
+// Trees, kept off the airfield.
+{
+  const trees = new THREE.InstancedMesh(new THREE.ConeGeometry(3, 10, 5), lambert(0x2a5a1e), 400);
+  const m = new THREE.Matrix4(), q = new THREE.Quaternion(), s = new V3(), pos = new V3();
+  for (let i = 0; i < 400; i++) {
+    let x, z;
+    do { x = (rand() - 0.5) * 2400; z = (rand() - 0.5) * 2400; } while (Math.abs(z) < 70 && Math.abs(x) < 440);
+    const k = 0.7 + rand() * 0.8;
+    s.set(k, k, k);
+    m.compose(pos.set(x, 5 * k, z), q, s);
+    trees.setMatrixAt(i, m);
+  }
+  scene.add(trees);
+}
+
+// A ring of hills in the distance, so you can tell which way you're facing.
+for (let i = 0; i < 40; i++) {
+  const a = (i / 40) * Math.PI * 2 + rand() * 0.1, r = 1450 + rand() * 300;
+  const h = 120 + rand() * 220;
+  const hill = new THREE.Mesh(new THREE.ConeGeometry(150 + rand() * 150, h, 6), lambert(rand() < 0.5 ? 0x5a7050 : 0x6a7a5a));
+  hill.position.set(Math.cos(a) * r, h / 2 - 5, Math.sin(a) * r);
+  hill.rotation.y = rand() * Math.PI;
+  scene.add(hill);
+}
+
+// Low-poly clouds you can fly through.
+const cloudMat = new THREE.MeshLambertMaterial({ color: 0xffffff, emissive: 0x556677, flatShading: true });
+const cloudGeo = new THREE.IcosahedronGeometry(1, 0);
+for (let i = 0; i < 30; i++) {
+  const cloud = new THREE.Group();
+  const a = rand() * Math.PI * 2, r = 100 + rand() * 1100;
+  cloud.position.set(Math.cos(a) * r, 150 + rand() * 180, Math.sin(a) * r);
+  for (let j = 0, n = 3 + Math.floor(rand() * 3); j < n; j++) {
+    const puff = new THREE.Mesh(cloudGeo, cloudMat);
+    const k = 12 + rand() * 14;
+    puff.scale.set(k * 1.4, k * 0.8, k);
+    puff.position.set((j - n / 2) * 16 + rand() * 6, rand() * 6, rand() * 14);
+    puff.rotation.set(rand() * 3, rand() * 3, rand() * 3);
+    cloud.add(puff);
+  }
+  scene.add(cloud);
+}
+
+// Biplane, built nose-first along -Z.
+function makePlane(body, wing) {
+  const g = new THREE.Group();
+  g.add(box(1.3, 1.3, 6.4, body, 0, 0, 0.4));
+  g.add(box(1.5, 1.5, 0.9, 0x999999, 0, 0, -3.2));
+  g.add(box(10, 0.15, 1.6, wing, 0, -0.55, -1.2, lit(wing)));
+  g.add(box(10.4, 0.15, 1.6, wing, 0, 2.2, -1.5, lit(wing)));
+  for (const x of [-3.8, 3.8]) g.add(box(0.12, 2.75, 0.12, 0x222222, x, 0.83, -1.35));
+  g.add(box(3.6, 0.12, 1.1, wing, 0, 0.1, 3.3));
+  g.add(box(0.12, 1.5, 1.1, body, 0, 0.9, 3.4));
+  for (const x of [-0.9, 0.9]) {
+    g.add(box(0.1, 1, 0.1, 0x222222, x, -1.0, -1.6));
+    g.add(box(0.3, 0.7, 0.7, 0x111111, x, -1.5, -1.6));
+  }
+  g.add(box(0.5, 0.5, 0.5, 0xffcc99, 0, 0.85, 0.8));
+  const blade = box(0.3, 4, 0.08, 0x8a6a40, 0, 0, -3.75);
+  const disc = new THREE.Mesh(new THREE.CircleGeometry(2.1, 12),
+    new THREE.MeshBasicMaterial({ color: 0xcccccc, transparent: true, opacity: 0.18, side: THREE.DoubleSide, depthWrite: false }));
+  disc.position.z = -3.76;
+  g.add(blade, disc);
+  scene.add(g);
+  return { g, blade, disc };
+}
+for (const p of players) {
+  Object.assign(p, makePlane(p.body, p.wing));
+  p.cam = new THREE.PerspectiveCamera(55, 1.6, 0.1, 3000);
+}
+
+// Particles and bullets are instanced cubes: cheap, and they look right at this resolution.
+const MAX_PARTICLES = 3000, MAX_BULLETS = 200;
+const partMesh = new THREE.InstancedMesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshBasicMaterial(), MAX_PARTICLES);
+const bulletMesh = new THREE.InstancedMesh(new THREE.BoxGeometry(0.35, 0.35, 4), new THREE.MeshBasicMaterial({ color: 0xffff88 }), MAX_BULLETS);
+partMesh.frustumCulled = bulletMesh.frustumCulled = false;
+for (let i = 0; i < MAX_PARTICLES; i++) partMesh.setColorAt(i, new THREE.Color());
+partMesh.count = bulletMesh.count = 0;
+scene.add(partMesh, bulletMesh);
+const colorCache = {};
+const toColor = c => (colorCache[c] ||= new THREE.Color(c));
+
+// ---------- Game ----------
+function resetPlane(p) {
+  p.pos.copy(p.start);
+  p.yaw = p.startYaw;
+  p.q.setFromAxisAngle(AY, p.yaw);
+  p.speed = 0;
+  p.fallVy = 0;
+  p.onGround = true;
+  p.state = 'alive';
+  p.cooldown = 0;
+  p.respawn = 0;
+  p.heat = 0;
+  p.jammed = false;
+  p.throttleOn = false;
+  p.stallWarn = 0;
+  p.stalled = false;
+  p.dyingT = 0;
+}
+
+function startGame() {
+  players.forEach(p => { p.score = 0; resetPlane(p); });
+  bullets = [];
+  particles = [];
+  game.state = 'play';
+  game.winner = null;
+}
+players.forEach(resetPlane);
+
+function burst(x, y, z, n, colors, speed, life, size = 1) {
+  record('burst', arguments);
+  for (let i = 0; i < n && particles.length < MAX_PARTICLES; i++) {
+    const u = Math.random() * 2 - 1, th = Math.random() * Math.PI * 2, r = Math.sqrt(1 - u * u);
+    const v = Math.random() * speed;
+    const l = life * (0.5 + Math.random() * 0.5);
+    particles.push({
+      x, y, z, vx: r * Math.cos(th) * v, vy: u * v + speed * 0.3, vz: r * Math.sin(th) * v,
+      life: l, max: l, color: colors[i % colors.length], grav: 30, size, grow: 0,
+    });
+  }
+}
+
+function puff(pos, color, life, size, grow) {
+  if (particles.length >= MAX_PARTICLES) return;
+  particles.push({
+    x: pos.x + Math.random() - 0.5, y: pos.y + Math.random() - 0.5, z: pos.z + Math.random() - 0.5,
+    vx: 0, vy: 3, vz: 0, life, max: life, color, grav: 0, size, grow,
+  });
+}
+
+function score(p) {
+  p.score++;
+  if (p.score >= WIN_SCORE) {
+    game.state = 'over';
+    game.winner = p;
+    // Give a held fire key time to let go before Space/Enter can restart.
+    game.readyAt = performance.now() + 1500;
+  }
+}
+
+function explode(p, awardOpponent) {
+  burst(p.pos.x, p.pos.y, p.pos.z, 60, ['#ff0', '#f80', '#f30', '#fff', '#555'], 40, 1.4, 1.6);
+  sfxBoom();
+  if (awardOpponent) score(other(p));
+  p.state = 'dead';
+  p.respawn = RESPAWN;
+  p.deathPos.copy(p.pos);
+}
+
+function shotDown(p, shooter) {
+  score(shooter);
+  p.state = 'dying';
+  p.dyingT = 0;
+  burst(p.pos.x, p.pos.y, p.pos.z, 14, ['#ff0', '#f80'], 25, 0.6);
+  sfxHit();
+  sfxBoom(0.3, 0.2);
+}
+
+function updateAxes(p) {
+  p.fwd.set(0, 0, -1).applyQuaternion(p.q);
+  p.up.set(0, 1, 0).applyQuaternion(p.q);
+  p.right.set(1, 0, 0).applyQuaternion(p.q);
+}
+const rotLocal = (p, axis, a) => p.q.multiply(tq.setFromAxisAngle(axis, a));
+const rotWorld = (p, axis, a) => p.q.premultiply(tq.setFromAxisAngle(axis, a));
+
+// Swing the nose toward a world direction, at most `rate` radians per second.
+function noseToward(p, target, rate, dt) {
+  const axis = tv1.crossVectors(p.fwd, target);
+  const s = axis.length();
+  const ang = Math.atan2(s, p.fwd.dot(target));
+  if (ang < 1e-4) return;
+  if (s < 1e-4) axis.copy(p.right); else axis.divideScalar(s);
+  rotWorld(p, axis, Math.min(ang, rate * dt));
+}
+
+function fire(p) {
+  p.cooldown = FIRE_DELAY;
+  p.heat += HEAT_PER_SHOT;
+  if (p.heat >= 1) { p.heat = 1; p.jammed = true; }
+  const o = tv2.set(0, 0.8, -3.4).applyQuaternion(p.q).add(p.pos);
+  const v = BULLET_SPEED + p.speed;
+  bullets.push({ x: o.x, y: o.y, z: o.z, vx: p.fwd.x * v, vy: p.fwd.y * v, vz: p.fwd.z * v, life: BULLET_LIFE, owner: p });
+  sfxShot();
+}
+
+function updatePlane(p, dt) {
+  if (p.state === 'dead') {
+    if ((p.respawn -= dt) <= 0) resetPlane(p);
+    return;
+  }
+  p.cooldown -= dt;
+  p.heat = Math.max(0, p.heat - (p.jammed ? JAMMED_COOL_RATE : COOL_RATE) * dt);
+  if (p.jammed && p.heat === 0) p.jammed = false;
+  updateAxes(p);
+
+  if (p.state === 'dying') {
+    // Spiral down trailing smoke.
+    p.dyingT += dt;
+    noseToward(p, DOWN, 0.9, dt);
+    rotLocal(p, AZ, 2.5 * dt);
+    p.speed += (50 - p.speed) * dt;
+    p.fallVy += GRAVITY * 0.3 * dt;
+  } else {
+    const pitch = (held(p, 'climb') ? 1 : 0) - (held(p, 'dive') ? 1 : 0);
+    const roll = (held(p, 'right') ? 1 : 0) - (held(p, 'left') ? 1 : 0);
+    // Guns only work once airborne.
+    if (held(p, 'fire') && p.cooldown <= 0 && !p.jammed && !p.onGround) fire(p);
+
+    if (p.onGround) {
+      p.speed = clamp(p.speed + (p.throttleOn ? GROUND_ACCEL : -GROUND_FRICTION) * dt, 0, MAX_SPEED);
+      // Roll keys steer on the ground.
+      p.yaw -= roll * TAXI_TURN * dt;
+      p.q.setFromAxisAngle(AY, p.yaw);
+      p.stallWarn = 0;
+      // Can't lift off below take-off speed.
+      if (pitch > 0 && p.speed >= TAKEOFF) {
+        p.onGround = false;
+        rotLocal(p, AX, 0.08);
+      }
+    } else {
+      const ctrl = p.stalled ? 0.35 : 1;
+      rotLocal(p, AX, pitch * PITCH_RATE * ctrl * dt);
+      rotLocal(p, AZ, -roll * ROLL_RATE * ctrl * dt);
+      // Banking turns the plane: right wing down turns right.
+      rotWorld(p, AY, p.right.y * BANK_TURN * dt);
+      updateAxes(p);
+
+      const thrust = p.throttleOn && p.pos.y < CEILING;
+      p.speed = clamp(p.speed + (thrust ? ACCEL : -DRAG) * dt - GRAVITY * p.fwd.y * dt, 0, MAX_SPEED);
+      // 0 at a safe speed, rising to 1 at the stall: drives the engine cough and cockpit shake.
+      p.stallWarn = clamp((STALL * 1.5 - p.speed) / (STALL * 0.5), 0, 1);
+      if (p.speed < STALL) p.stalled = true;
+      else if (p.stalled && p.speed > STALL * 1.4) p.stalled = false;
+      if (p.stalled) {
+        p.fallVy += GRAVITY * dt;
+        noseToward(p, DOWN, 1.6, dt);
+      } else {
+        p.fallVy = Math.max(0, p.fallVy - GRAVITY * 2 * dt);
+      }
+
+      // Past the edge of the arena, the plane is turned back toward the middle.
+      const hx = p.pos.x, hz = p.pos.z;
+      if (Math.hypot(hx, hz) > ARENA && p.fwd.x * hx + p.fwd.z * hz > 0) {
+        rotWorld(p, AY, Math.sign(p.fwd.x * hz - p.fwd.z * hx) * BOUNDARY_TURN * dt);
+      }
+    }
+  }
+
+  updateAxes(p);
+  p.pos.addScaledVector(p.fwd, p.speed * dt);
+  if (p.onGround) p.pos.y = GEAR;
+  else p.pos.y -= p.fallVy * dt;
+
+  if ((!p.onGround && p.pos.y < GEAR * 0.5) || inHut(p.pos) || p.dyingT > 12) explode(p, p.state === 'alive');
+}
+
+// Distance from point c to the segment a-b, so fast bullets can't skip through a plane.
+function segDist(ax, ay, az, bx, by, bz, c) {
+  const dx = bx - ax, dy = by - ay, dz = bz - az;
+  const l2 = dx * dx + dy * dy + dz * dz;
+  const t = l2 ? clamp(((c.x - ax) * dx + (c.y - ay) * dy + (c.z - az) * dz) / l2, 0, 1) : 0;
+  return Math.hypot(ax + dx * t - c.x, ay + dy * t - c.y, az + dz * t - c.z);
+}
+
+function updateBullets(dt) {
+  for (const bl of bullets) {
+    const ox = bl.x, oy = bl.y, oz = bl.z;
+    bl.x += bl.vx * dt;
+    bl.y += bl.vy * dt;
+    bl.z += bl.vz * dt;
+    bl.life -= dt;
+    if (bl.y <= 0) {
+      bl.life = 0;
+      burst(bl.x, 0.3, bl.z, 3, ['#6b4a2a', '#3a7a2a'], 8, 0.4, 0.6);
+      continue;
+    }
+    if (inHut(bl)) {
+      bl.life = 0;
+      burst(bl.x, bl.y, bl.z, 3, ['#a0643a', '#fff'], 8, 0.3, 0.6);
+      continue;
+    }
+    if (bl.life <= 0) continue;
+    const target = other(bl.owner);
+    // Planes still on the runway are protected, so nobody can be spawn-camped.
+    if (game.state === 'play' && target.state === 'alive' && !target.onGround
+        && segDist(ox, oy, oz, bl.x, bl.y, bl.z, target.pos) < HIT_RADIUS) {
+      bl.life = 0;
+      shotDown(target, bl.owner);
+    }
+  }
+  bullets = bullets.filter(bl => bl.life > 0);
+}
+
+// Smoke trails are only cosmetic, so the guest spawns its own from the state the host sends.
+function spawnTrails() {
+  if (game.state !== 'play') return;
+  for (const p of players) {
+    // Behind the plane, so a stalling pilot's own puffs don't cover the view.
+    const tail = tv2.copy(p.pos).addScaledVector(p.fwd, -5);
+    if (p.state === 'dying' && Math.random() < 0.8) puff(tail, Math.random() < 0.5 ? '#444' : '#777', 1.6, 2, 3);
+    else if (p.state === 'alive' && !p.onGround && p.stallWarn > 0.6 && Math.random() < 0.3) puff(tail, '#aaa', 0.8, 1.2, 2);
+  }
+}
+
+function updateParticles(dt) {
+  for (const pt of particles) {
+    pt.vy -= pt.grav * dt;
+    pt.x += pt.vx * dt;
+    pt.y += pt.vy * dt;
+    pt.z += pt.vz * dt;
+    pt.life -= dt;
+    if (pt.y < 0.3) { pt.y = 0.3; pt.vy *= -0.3; pt.vx *= 0.5; pt.vz *= 0.5; }
+  }
+  particles = particles.filter(pt => pt.life > 0);
+}
+
+function update(dt) {
+  if (game.state === 'play') {
+    players.forEach(p => updatePlane(p, dt));
+    const [a, b] = players;
+    if (a.state === 'alive' && b.state === 'alive' && a.pos.distanceTo(b.pos) < PLANE_COLLIDE) {
+      // Mid-air collisions destroy both planes and score nothing.
+      explode(a, false);
+      explode(b, false);
+    }
+  }
+  updateBullets(dt);
+  spawnTrails();
+  updateParticles(dt);
+  updateEngines();
+}
+
+// The guest doesn't simulate the game, only the effects around the host's state.
+function updateGuest(dt) {
+  players.forEach(updateAxes);
+  spawnTrails();
+  updateParticles(dt);
+  updateEngines();
+  sendInput(performance.now());
+}
+
+// ---------- Render ----------
+const hud = document.getElementById('hud').getContext('2d');
+hud.setTransform(2, 0, 0, 2, 0, 0);
+const dummy = new THREE.Object3D();
+const BULLET_AXIS = new V3(0, 0, 1);
+
+function syncMeshes(dt) {
+  for (const p of players) {
+    p.g.visible = p.state !== 'dead';
+    p.g.position.copy(p.pos);
+    p.g.quaternion.copy(p.q);
+    const spin = p.throttleOn ? 60 : p.speed * 0.4;
+    p.blade.rotation.z += spin * dt;
+    p.disc.visible = spin > 20;
+    p.blade.visible = spin <= 20;
+  }
+  partMesh.count = particles.length;
+  particles.forEach((pt, i) => {
+    const s = pt.size * (1 + (1 - pt.life / pt.max) * pt.grow);
+    dummy.position.set(pt.x, pt.y, pt.z);
+    dummy.quaternion.identity();
+    dummy.scale.set(s, s, s);
+    dummy.updateMatrix();
+    partMesh.setMatrixAt(i, dummy.matrix);
+    partMesh.setColorAt(i, toColor(pt.color));
+  });
+  partMesh.instanceMatrix.needsUpdate = true;
+  partMesh.instanceColor.needsUpdate = true;
+
+  bulletMesh.count = Math.min(bullets.length, MAX_BULLETS);
+  for (let i = 0; i < bulletMesh.count; i++) {
+    const bl = bullets[i];
+    dummy.position.set(bl.x, bl.y, bl.z);
+    dummy.quaternion.setFromUnitVectors(BULLET_AXIS, tv1.set(bl.vx, bl.vy, bl.vz).normalize());
+    dummy.scale.set(1, 1, 1);
+    dummy.updateMatrix();
+    bulletMesh.setMatrixAt(i, dummy.matrix);
+  }
+  bulletMesh.instanceMatrix.needsUpdate = true;
+}
+
+// In the cockpit while flying; a chase view while going down; then watch the wreck.
+function updateCamera(p, dt) {
+  const cam = p.cam;
+  if (p.state === 'alive') {
+    cam.position.copy(COCKPIT).applyQuaternion(p.q).add(p.pos);
+    cam.quaternion.copy(p.q);
+    const shake = p.onGround ? 0 : p.stallWarn * 0.025;
+    if (shake) {
+      const t = performance.now() / 1000;
+      cam.quaternion.multiply(tq.setFromAxisAngle(AZ, Math.sin(t * 31) * shake));
+      cam.quaternion.multiply(tq.setFromAxisAngle(AX, Math.sin(t * 23) * shake * 0.5));
+    }
+  } else if (p.state === 'dying') {
+    // Hang back and above the falling plane, on whichever side the camera already is.
+    tv1.subVectors(cam.position, p.pos).setY(0);
+    if (tv1.lengthSq() < 1) tv1.set(-p.fwd.x, 0, -p.fwd.z);
+    tv1.normalize().multiplyScalar(30).add(p.pos);
+    tv1.y = Math.max(p.pos.y + 12, 4);
+    cam.position.lerp(tv1, 1 - Math.exp(-3 * dt));
+    cam.lookAt(p.pos);
+  } else {
+    cam.lookAt(p.deathPos);
+  }
+  cam.updateMatrixWorld();
+}
+
+// Viewports in render pixels (WebGL counts y from the bottom) and HUD units.
+function views() {
+  if (net.mode === 'local') {
+    return [
+      { p: players[0], gl: [0, RH / 2, RW, RH / 2], hud: [0, 0, 960, 300] },
+      { p: players[1], gl: [0, 0, RW, RH / 2], hud: [0, 300, 960, 300] },
+    ];
+  }
+  return [{ p: players[net.me], gl: [0, 0, RW, RH], hud: [0, 0, 960, 600] }];
+}
+
+function drawText(text, x, y, size, color, align = 'center') {
+  hud.font = `${size}px 'Press Start 2P', monospace`;
+  hud.textAlign = align;
+  hud.fillStyle = '#000';
+  const o = Math.max(2, size / 7);
+  hud.fillText(text, x + o, y + o);
+  hud.fillStyle = color;
+  hud.fillText(text, x, y);
+}
+
+function drawOpponentMarker(p, o, [vx, vy, vw, vh], small) {
+  if (o.state === 'dead') return;
+  const cx = vx + vw / 2, cy = vy + vh / 2;
+  const d = p.pos.distanceTo(o.pos);
+  const local = tv1.copy(o.pos).applyMatrix4(p.cam.matrixWorldInverse);
+  hud.strokeStyle = hud.fillStyle = o.hud;
+  hud.lineWidth = 2;
+  if (local.z < 0) {
+    const ndc = tv2.copy(o.pos).project(p.cam);
+    if (Math.abs(ndc.x) < 0.95 && Math.abs(ndc.y) < 0.9) {
+      // On screen: corner brackets around the plane and its range.
+      const sx = cx + (ndc.x * vw) / 2, sy = cy - (ndc.y * vh) / 2;
+      const span = (10 / d / (2 * Math.tan(THREE.MathUtils.degToRad(p.cam.fov / 2)))) * vh;
+      const s = Math.max(10, span * 0.7), c = s * 0.45;
+      hud.beginPath();
+      for (const [ex, ey] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) {
+        hud.moveTo(sx + ex * s, sy + ey * (s - c));
+        hud.lineTo(sx + ex * s, sy + ey * s);
+        hud.lineTo(sx + ex * (s - c), sy + ey * s);
+      }
+      hud.stroke();
+      drawText(`${Math.round(d)}`, sx, sy + s + (small ? 14 : 18), small ? 8 : 10, o.hud);
+      return;
+    }
+  }
+  // Off screen: an arrow at the edge pointing the way to turn.
+  let dx = local.x, dy = -local.y;
+  if (Math.hypot(dx, dy) < 1e-3) dy = 1;
+  const a = Math.atan2(dy, dx);
+  const ax = cx + Math.cos(a) * (vw / 2 - 30), ay = cy + Math.sin(a) * (vh / 2 - 26);
+  hud.save();
+  hud.translate(ax, ay);
+  hud.rotate(a);
+  hud.beginPath();
+  hud.moveTo(12, 0);
+  hud.lineTo(-6, -9);
+  hud.lineTo(-6, 9);
+  hud.closePath();
+  hud.fill();
+  hud.restore();
+}
+
+function drawView({ p, hud: rect }) {
+  const [vx, vy, vw, vh] = rect;
+  const small = vh < 400;
+  const f = small ? 10 : 12, big = small ? 16 : 22;
+  const cx = vx + vw / 2, cy = vy + vh / 2;
+  hud.save();
+  hud.beginPath();
+  hud.rect(vx, vy, vw, vh);
+  hud.clip();
+
+  const [a, b] = players;
+  drawText(`${a.name} ${a.score}`, vx + 16, vy + 30, small ? 14 : 20, a.hud, 'left');
+  drawText(`${b.score} ${b.name}`, vx + vw - 16, vy + 30, small ? 14 : 20, b.hud, 'right');
+  if (net.mode === 'local') drawText(p.name, cx, vy + 30, small ? 10 : 12, p.hud);
+
+  if (game.state === 'play') {
+    drawOpponentMarker(p, other(p), rect, small);
+
+    if (p.state === 'alive') {
+      // Gunsight.
+      hud.strokeStyle = p.hud;
+      hud.lineWidth = 2;
+      hud.beginPath();
+      hud.arc(cx, cy, 12, 0, Math.PI * 2);
+      for (const [ex, ey] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        hud.moveTo(cx + ex * 16, cy + ey * 16);
+        hud.lineTo(cx + ex * 24, cy + ey * 24);
+      }
+      hud.stroke();
+      hud.fillStyle = p.hud;
+      hud.fillRect(cx - 1, cy - 1, 3, 3);
+
+      // Instruments, bottom left.
+      const ly = vy + vh - 16;
+      drawText(`SPD ${Math.round(p.speed)}`, vx + 16, ly - f * 4, f, '#fff', 'left');
+      drawText(`ALT ${Math.round(Math.max(0, p.pos.y - GEAR))}`, vx + 16, ly - f * 2, f, '#fff', 'left');
+      drawText(p.throttleOn ? 'ENGINE ON' : 'ENGINE OFF', vx + 16, ly, f, p.throttleOn ? '#6f6' : '#888', 'left');
+
+      // Gun heat, bottom right.
+      const w = 120, h = 8, hx = vx + vw - 16 - w, hy = ly - 8;
+      const blink = Math.floor(performance.now() / 150) % 2;
+      hud.fillStyle = '#000';
+      hud.fillRect(hx, hy, w, h);
+      hud.fillStyle = p.jammed ? (blink ? '#f22' : '#800') : p.heat > 0.7 ? '#f80' : '#fc4';
+      hud.fillRect(hx + 1, hy + 1, (w - 2) * p.heat, h - 2);
+      drawText(p.jammed ? 'JAMMED' : 'GUN', hx + w / 2, hy - 8, f, p.jammed ? '#f44' : '#fff');
+
+      // Warnings and take-off hints.
+      const wy = cy + vh * 0.28;
+      if (p.onGround) {
+        const hint = !p.throttleOn ? `${keyLabel(p, 'throttle')}: ENGINE ON`
+          : p.speed < TAKEOFF ? 'GATHERING SPEED...' : `${keyLabel(p, 'climb')}: TAKE OFF`;
+        drawText(hint, cx, wy, f, '#ff0');
+      } else if (p.stallWarn > 0.3 && blink) {
+        drawText('STALL', cx, wy, big, '#f44');
+      } else if (Math.hypot(p.pos.x, p.pos.z) > ARENA - 60) {
+        drawText('TURN BACK', cx, wy, big, '#ff0');
+      }
+    } else if (p.state === 'dying') {
+      drawText('SHOT DOWN!', cx, cy - vh * 0.2, big, '#f44');
+    } else {
+      drawText('NEW PLANE COMING...', cx, cy - vh * 0.2, f, '#fff');
+    }
+  }
+  hud.restore();
+}
+
+function render(dt) {
+  syncMeshes(dt);
+  hud.clearRect(0, 0, 960, 600);
+  for (const v of views()) {
+    const cam = v.p.cam, [x, y, w, h] = v.gl;
+    cam.aspect = w / h;
+    cam.fov = h < RH ? 40 : 55;
+    cam.updateProjectionMatrix();
+    updateCamera(v.p, dt);
+    sky.position.copy(cam.position);
+    renderer.setViewport(x, y, w, h);
+    renderer.setScissor(x, y, w, h);
+    renderer.render(scene, cam);
+    drawView(v);
+  }
+  if (net.mode === 'local') {
+    hud.fillStyle = '#444';
+    hud.fillRect(0, 298, 960, 4);
+  }
+
+  if (game.state !== 'play') {
+    hud.fillStyle = 'rgba(0,0,0,0.35)';
+    hud.fillRect(0, 0, 960, 600);
+  }
+  if (game.state === 'title') {
+    drawText('BIP 3D', 480, 250, 64, '#ff0');
+    drawText(`FIRST TO ${WIN_SCORE}`, 480, 320, 20, '#fff');
+    drawText('PRESS SPACE', 480, 370, 20, '#fff');
+  } else if (game.state === 'over') {
+    drawText(`${game.winner.name} WINS!`, 480, 270, 40, game.winner.hud);
+    if (performance.now() > game.readyAt) drawText('PRESS SPACE', 480, 340, 20, '#fff');
+  }
+  if (game.state !== 'play' && net.mode !== 'local') {
+    const me = players[net.me];
+    drawText(`YOU ARE ${me.name}`, 480, 430, 20, me.hud);
+  }
+}
+
+// ---------- Online ----------
+// The host's browser runs the game and the guest's browser just draws it. The guest sends its
+// controls to the host, and the host sends back the game state plus the effects (bursts and
+// sounds) that happened since the last update, so the guest can replay them.
+const PEER_PREFIX = 'jaybizzle-bip3d-';
+const SEND_INTERVAL = 1000 / 60;
+// The guest resends its controls at least this often so the host knows it's still there,
+// and either side gives up on the other after TIMEOUT of silence.
+const HEARTBEAT = 1000, TIMEOUT = 5000;
+const FX = { burst, sfxShot, sfxBoom, sfxHit };
+
+const hostBtn = document.getElementById('host-btn');
+const copyBtn = document.getElementById('copy-btn');
+const linkEl = document.getElementById('link');
+const statusEl = document.getElementById('status');
+
+function setStatus(text, color = '#ccc') {
+  statusEl.textContent = text;
+  statusEl.style.color = color;
+  linkEl.hidden = copyBtn.hidden = true;
+}
+
+function showLink(code) {
+  setStatus('SEND THIS LINK TO YOUR OPPONENT:');
+  linkEl.value = `${location.origin}${location.pathname}#join=${code}`;
+  linkEl.hidden = copyBtn.hidden = false;
+  copyBtn.textContent = 'COPY';
+}
+
+function hostGame() {
+  hostBtn.hidden = true;
+  setStatus('STARTING...');
+  const code = net.code = Math.random().toString(36).slice(2, 8);
+  const peer = net.peer = new Peer(PEER_PREFIX + code);
+  peer.on('open', () => showLink(code));
+  // Stay reachable if the connection to the matchmaking server blips.
+  peer.on('disconnected', () => { if (!peer.destroyed) peer.reconnect(); });
+  peer.on('connection', conn => {
+    // One opponent at a time.
+    if (net.conn) { conn.on('open', () => conn.close()); return; }
+    conn.on('open', () => connected(conn, 'host'));
+    conn.on('close', () => { if (net.conn === conn) disconnected(); });
+  });
+  peer.on('error', err => {
+    // Someone else already has this code, so pick another.
+    if (err.type === 'unavailable-id') { peer.destroy(); hostGame(); return; }
+    peerError(err);
+  });
+}
+
+function joinGame(code) {
+  hostBtn.hidden = true;
+  setStatus('CONNECTING...');
+  const peer = net.peer = new Peer();
+  peer.on('open', () => {
+    const conn = peer.connect(PEER_PREFIX + code, { serialization: 'json' });
+    conn.on('open', () => connected(conn, 'guest'));
+    conn.on('close', () => { if (net.conn === conn) disconnected(); });
+  });
+  peer.on('error', peerError);
+}
+
+function peerError(err) {
+  if (net.conn) return;
+  setStatus(err.type === 'peer-unavailable' ? 'GAME NOT FOUND. ASK FOR A NEW LINK.' : `CONNECTION FAILED (${err.type})`, '#f44');
+  net.peer?.destroy();
+  net.peer = null;
+  hostBtn.hidden = false;
+}
+
+function connected(conn, mode) {
+  net.conn = conn;
+  net.mode = mode;
+  net.me = mode === 'host' ? 0 : 1;
+  net.remote = {};
+  net.events = [];
+  net.sentInput = '';
+  net.lastHeard = performance.now();
+  conn.on('data', msg => {
+    net.lastHeard = performance.now();
+    (mode === 'host' ? receiveFromGuest : receiveFromHost)(msg);
+  });
+  players.forEach(p => { p.score = 0; resetPlane(p); });
+  bullets = [];
+  particles = [];
+  game.state = 'title';
+  keysEl.hidden = true;
+  const me = players[net.me];
+  setStatus(`CONNECTED! YOU ARE ${me.name}. EITHER SET OF KEYS FLIES YOUR PLANE.`, me.hud);
+}
+
+// The host keeps listening on the same link, so the opponent can rejoin.
+function disconnected() {
+  const conn = net.conn, wasHost = net.mode === 'host';
+  net.conn = null;
+  net.mode = 'local';
+  conn.close();
+  game.state = 'title';
+  keysEl.hidden = false;
+  if (wasHost) {
+    showLink(net.code);
+    statusEl.textContent = 'OPPONENT LEFT. SEND THE LINK AGAIN:';
+  } else {
+    net.peer.destroy();
+    net.peer = null;
+    history.replaceState(null, '', location.pathname);
+    setStatus('LOST CONNECTION TO HOST.', '#f44');
+    hostBtn.hidden = false;
+  }
+}
+
+function receiveFromGuest(msg) {
+  if (msg.t === 'input') net.remote = msg;
+  else if (msg.t === 'throttle') toggleThrottle(players[1]);
+  else if (msg.t === 'start' && game.state !== 'play' && performance.now() > game.readyAt) startGame();
+}
+
+function sendInput(now) {
+  const me = players[1];
+  const input = { t: 'input' };
+  for (const a of ['climb', 'dive', 'left', 'right', 'fire']) input[a] = held(me, a);
+  const json = JSON.stringify(input);
+  if (json === net.sentInput && now - net.lastSend < HEARTBEAT) return;
+  net.sentInput = json;
+  net.lastSend = now;
+  net.conn.send(input);
+}
+
+const r = v => Math.round(v * 100) / 100;
+const r4 = v => Math.round(v * 10000) / 10000;
+
+function sendState(now) {
+  if (now - net.lastSend < SEND_INTERVAL - 2) return;
+  net.lastSend = now;
+  net.conn.send({
+    t: 'state',
+    game: { state: game.state, winner: players.indexOf(game.winner) },
+    players: players.map(p => ({
+      pos: p.pos.toArray().map(r), q: p.q.toArray().map(r4), deathPos: p.deathPos.toArray().map(r),
+      speed: r(p.speed), state: p.state, onGround: p.onGround, throttleOn: p.throttleOn,
+      stallWarn: r(p.stallWarn), heat: r(p.heat), jammed: p.jammed, score: p.score,
+    })),
+    bullets: bullets.map(bl => [bl.x, bl.y, bl.z, bl.vx, bl.vy, bl.vz].map(r)),
+    events: net.events,
+  });
+  net.events = [];
+}
+
+function receiveFromHost(s) {
+  if (s.t !== 'state') return;
+  if (s.game.state === 'over' && game.state !== 'over') game.readyAt = performance.now() + 1500;
+  game.state = s.game.state;
+  game.winner = players[s.game.winner] || null;
+  s.players.forEach((q, i) => {
+    const p = players[i];
+    p.pos.fromArray(q.pos);
+    p.q.fromArray(q.q);
+    p.deathPos.fromArray(q.deathPos);
+    Object.assign(p, { speed: q.speed, state: q.state, onGround: q.onGround, throttleOn: q.throttleOn,
+      stallWarn: q.stallWarn, heat: q.heat, jammed: q.jammed, score: q.score });
+  });
+  bullets = s.bullets.map(([x, y, z, vx, vy, vz]) => ({ x, y, z, vx, vy, vz }));
+  for (const [name, ...args] of s.events) FX[name](...args);
+}
+
+hostBtn.addEventListener('click', () => { hostBtn.blur(); hostGame(); });
+copyBtn.addEventListener('click', () => {
+  copyBtn.blur();
+  navigator.clipboard.writeText(linkEl.value).then(() => { copyBtn.textContent = 'COPIED'; });
+});
+// Closing the tab tells the other side straight away instead of leaving it to time out.
+addEventListener('pagehide', () => net.conn?.close());
+const joinCode = location.hash.match(/^#join=(\w+)$/);
+if (joinCode) joinGame(joinCode[1]);
+
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min((now - last) / 1000, 1 / 30);
+  last = now;
+  if (net.conn && now - net.lastHeard > TIMEOUT) disconnected();
+  if (net.mode === 'guest') {
+    updateGuest(dt);
+  } else {
+    update(dt);
+    if (net.mode === 'host') sendState(now);
+  }
+  render(dt);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
